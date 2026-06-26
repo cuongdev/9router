@@ -3,7 +3,7 @@ import {
   markAccountUnavailable,
   clearAccountError,
   extractApiKey,
-  isValidApiKey,
+  getApiKeyContext,
 } from "../services/auth.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo } from "../services/model.js";
@@ -12,6 +12,7 @@ import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
+import { ApiKeyAccessDeniedError, accessDeniedResponse } from "@/lib/access/apiKeyAccessPolicy.js";
 
 /**
  * Handle embeddings request for the SSE/Next.js server.
@@ -43,13 +44,14 @@ export async function handleEmbeddings(request) {
 
   // Enforce API key if enabled in settings
   const settings = await getSettings();
+  let apiKeyContext = { rawKey: apiKey, apiKey: null, accessPolicy: null };
+  if (apiKey) apiKeyContext = await getApiKeyContext(apiKey);
   if (settings.requireApiKey) {
     if (!apiKey) {
       log.warn("AUTH", "Missing API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
     }
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) {
+    if (!apiKeyContext.apiKey) {
       log.warn("AUTH", "Invalid API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
     }
@@ -85,7 +87,13 @@ export async function handleEmbeddings(request) {
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
+    let credentials;
+    try {
+      credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { accessPolicy: apiKeyContext.accessPolicy });
+    } catch (error) {
+      if (error instanceof ApiKeyAccessDeniedError) return accessDeniedResponse(error);
+      throw error;
+    }
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {

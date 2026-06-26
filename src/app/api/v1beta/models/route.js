@@ -1,4 +1,4 @@
-import { PROVIDER_MODELS } from "@/shared/constants/models";
+import { buildModelsList, getDiscoveryAccessPolicy } from "../../v1/models/route.js";
 
 /**
  * Handle CORS preflight
@@ -17,8 +17,10 @@ export async function OPTIONS() {
  * GET /v1beta/models - Gemini compatible models list
  * Returns models in Gemini API format
  */
-export async function GET() {
+export async function GET(request) {
   try {
+    // Access-policy-filtered discovery list (combos + connected provider models).
+    const visibleModels = await buildModelsList(["llm"], await getDiscoveryAccessPolicy(request));
     const models = [];
     const seen = new Set();
 
@@ -34,23 +36,24 @@ export async function GET() {
         outputTokenLimit: 8192,
       });
     }
-    
-    for (const [provider, providerModels] of Object.entries(PROVIDER_MODELS)) {
-      for (const model of providerModels) {
-        addModel({
-          name: `models/${provider}/${model.id}`,
-          displayName: model.name || model.id,
-          description: `${provider} model: ${model.name || model.id}`,
-        });
 
-        if (provider === "gemini") {
-          addModel({
-            name: `models/${model.id}`,
-            displayName: model.name || model.id,
-            description: `Gemini model: ${model.name || model.id}`,
-            methods: ["generateContent", "streamGenerateContent"],
-          });
-        }
+    for (const model of visibleModels) {
+      addModel({
+        name: `models/${model.id}`,
+        displayName: model.id,
+        description: `${model.owned_by || "provider"} model: ${model.id}`,
+      });
+
+      // Gemini native endpoint: also expose the bare model name + streaming method
+      // so @google/genai SDK clients can call models/{id}:streamGenerateContent.
+      if (model.owned_by === "gemini" && model.id.includes("/")) {
+        const bareId = model.id.slice(model.id.indexOf("/") + 1);
+        addModel({
+          name: `models/${bareId}`,
+          displayName: bareId,
+          description: `Gemini model: ${bareId}`,
+          methods: ["generateContent", "streamGenerateContent"],
+        });
       }
     }
 

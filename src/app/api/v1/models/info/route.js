@@ -1,4 +1,5 @@
 import { PROVIDER_MODELS } from "open-sse/config/providerModels.js";
+import { buildModelsList, getDiscoveryAccessPolicy } from "../route.js";
 import { AI_PROVIDERS, ALIAS_TO_ID } from "@/shared/constants/providers";
 import { getModelKind } from "@/shared/constants/models";
 
@@ -94,6 +95,15 @@ export async function GET(request) {
     );
   }
   const info = lookup(id, kind);
+  if (info) {
+    const visible = await buildModelsList([kind || info.kind || "llm"], await getDiscoveryAccessPolicy(request));
+    if (!visible.some((model) => model.id === id)) {
+      return Response.json(
+        { error: { message: `Model not found: ${id}`, type: "not_found" } },
+        { status: 404, headers: { "Access-Control-Allow-Origin": "*" } },
+      );
+    }
+  }
   if (!info) {
     return Response.json(
       { error: { message: `Model not found: ${id}`, type: "not_found" } },

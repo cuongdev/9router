@@ -275,6 +275,11 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
         earliestRetryAfter = retryAfter;
       }
 
+      if (result.status === 403 && /api key.*not authorized|access_denied/i.test(String(errorText))) {
+        log.warn("COMBO", `Model ${modelStr} failed access policy check`, { status: result.status });
+        return result;
+      }
+
       // Normalize error text to string (Worker-safe)
       if (typeof errorText !== "string") {
         try { errorText = JSON.stringify(errorText); } catch { errorText = String(errorText); }

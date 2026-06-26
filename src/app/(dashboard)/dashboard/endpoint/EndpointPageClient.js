@@ -17,6 +17,7 @@ import EndpointRow from "./components/EndpointRow";
 import StatusAlert from "./components/StatusAlert";
 import Tooltip from "./components/Tooltip";
 import SecurityWarning from "./components/SecurityWarning";
+import { getModelsByProviderId } from "@/shared/constants/models";
 export default function APIPageClient({ machineId }) {
   const [keys, setKeys] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -24,6 +25,11 @@ export default function APIPageClient({ machineId }) {
   const [newKeyName, setNewKeyName] = useState("");
   const [createdKey, setCreatedKey] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
+  const [accessModalKey, setAccessModalKey] = useState(null);
+  const [accessDraft, setAccessDraft] = useState({ mode: "unrestricted", accounts: [], combos: [] });
+  const [accessSaving, setAccessSaving] = useState(false);
+  const [providerAccounts, setProviderAccounts] = useState([]);
+  const [combos, setCombos] = useState([]);
 
   const [requireApiKey, setRequireApiKey] = useState(false);
   const [requireLogin, setRequireLogin] = useState(true);
@@ -255,10 +261,22 @@ export default function APIPageClient({ machineId }) {
 
   const fetchData = async () => {
     try {
-      const keysRes = await fetch("/api/keys");
+      const [keysRes, providersRes, combosRes] = await Promise.all([
+        fetch("/api/keys"),
+        fetch("/api/providers"),
+        fetch("/api/combos"),
+      ]);
       const keysData = await keysRes.json();
       if (keysRes.ok) {
         setKeys(keysData.keys || []);
+      }
+      if (providersRes.ok) {
+        const providersData = await providersRes.json();
+        setProviderAccounts(providersData.connections || []);
+      }
+      if (combosRes.ok) {
+        const combosData = await combosRes.json();
+        setCombos(combosData.combos || []);
       }
     } catch (error) {
       console.log("Error fetching data:", error);
@@ -667,6 +685,86 @@ export default function APIPageClient({ machineId }) {
     }
   };
 
+  const normalizePolicy = (policy) => {
+    if (!policy || policy.mode !== "restricted") return { mode: "unrestricted", accounts: [], combos: [] };
+    return {
+      mode: "restricted",
+      accounts: Array.isArray(policy.accounts) ? policy.accounts.map((grant) => ({
+        connectionId: grant.connectionId,
+        models: grant.models?.mode === "selected"
+          ? { mode: "selected", ids: Array.isArray(grant.models.ids) ? grant.models.ids : [] }
+          : { mode: "all", ids: [] },
+      })) : [],
+      combos: Array.isArray(policy.combos) ? policy.combos : [],
+    };
+  };
+
+  const openAccessModal = (key) => {
+    setAccessModalKey(key);
+    setAccessDraft(normalizePolicy(key.accessPolicy));
+  };
+
+  const updateAccountGrant = (connectionId, patch) => {
+    setAccessDraft((prev) => {
+      const accounts = [...(prev.accounts || [])];
+      const index = accounts.findIndex((grant) => grant.connectionId === connectionId);
+      if (patch === null) {
+        if (index >= 0) accounts.splice(index, 1);
+      } else if (index >= 0) {
+        accounts[index] = { ...accounts[index], ...patch };
+      } else {
+        accounts.push({ connectionId, models: { mode: "all", ids: [] }, ...patch });
+      }
+      return { ...prev, accounts };
+    });
+  };
+
+  const setSelectedModelIds = (connectionId, ids) => {
+    updateAccountGrant(connectionId, {
+      models: { mode: "selected", ids: Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean))) },
+    });
+  };
+
+  const toggleSelectedModelId = (connectionId, grant, modelId, checked) => {
+    const current = new Set(grant.models?.ids || []);
+    if (checked) current.add(modelId);
+    else current.delete(modelId);
+    setSelectedModelIds(connectionId, [...current]);
+  };
+
+  const toggleComboGrant = (comboName, checked) => {
+    setAccessDraft((prev) => {
+      const current = new Set(prev.combos || []);
+      if (checked) current.add(comboName);
+      else current.delete(comboName);
+      return { ...prev, combos: [...current] };
+    });
+  };
+
+  const saveAccessPolicy = async () => {
+    if (!accessModalKey) return;
+    setAccessSaving(true);
+    try {
+      const accessPolicy = accessDraft.mode === "restricted"
+        ? accessDraft
+        : { mode: "unrestricted" };
+      const res = await fetch(`/api/keys/${accessModalKey.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accessPolicy }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setKeys(prev => prev.map(k => k.id === accessModalKey.id ? data.key : k));
+        setAccessModalKey(null);
+      }
+    } catch (error) {
+      console.log("Error saving access policy:", error);
+    } finally {
+      setAccessSaving(false);
+    }
+  };
+
   const maskKey = (fullKey) => {
     if (!fullKey || fullKey.length <= 10) return fullKey || "";
     return fullKey.slice(0, 6) + "•".repeat(fullKey.length - 10) + fullKey.slice(-4);
@@ -1024,11 +1122,28 @@ export default function APIPageClient({ machineId }) {
                   <p className="text-xs text-text-muted mt-1">
                     Created {new Date(key.createdAt).toLocaleDateString()}
                   </p>
+                  <div className="flex items-center gap-2 mt-1">
+                    <span className={`text-[11px] px-2 py-0.5 rounded ${key.accessPolicy?.mode === "restricted" ? "bg-amber-500/10 text-amber-600 dark:text-amber-400" : "bg-success/10 text-success"}`}>
+                      {key.accessPolicy?.mode === "restricted" ? "Restricted" : "Full access"}
+                    </span>
+                    {key.accessPolicy?.mode === "restricted" && (
+                      <span className="text-xs text-text-muted">
+                        {key.accessPolicy.accounts?.length || 0} accounts, {key.accessPolicy.combos?.length || 0} combos
+                      </span>
+                    )}
+                  </div>
                   {key.isActive === false && (
                     <p className="text-xs text-orange-500 mt-1">Paused</p>
                   )}
                 </div>
                 <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => openAccessModal(key)}
+                    className="px-2 py-1 text-xs rounded border border-border hover:bg-surface-2 text-text-muted hover:text-primary transition-colors"
+                    title="Edit access policy"
+                  >
+                    Access
+                  </button>
                   <Toggle
                     size="sm"
                     checked={key.isActive ?? true}
@@ -1060,6 +1175,307 @@ export default function APIPageClient({ machineId }) {
           </div>
         )}
       </Card>
+
+      {/* Token Saver (RTK + Caveman) */}
+      <Card id="rtk">
+        <div className="flex items-center justify-between mb-2">
+          <h2 className="text-lg font-semibold flex items-center gap-2">
+            <span className="material-symbols-outlined text-primary">bolt</span>
+            Token Saver
+          </h2>
+        </div>
+        <div className="flex items-center justify-between pt-2 pb-4 border-b border-border gap-4">
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">
+              Compress tool output{" "}
+              <a
+                href="https://github.com/rtk-ai/rtk"
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs font-normal text-primary underline hover:opacity-80"
+              >
+                (RTK)
+              </a>
+            </p>
+            <p className="text-sm text-text-muted">
+              git/grep/ls/tree/logs → 60-90% fewer input tokens
+            </p>
+          </div>
+          <Toggle
+            checked={rtkEnabled}
+            onChange={() => handleRtkEnabled(!rtkEnabled)}
+          />
+        </div>
+        <div className="flex items-center justify-between py-4 border-b border-border gap-4 flex-wrap">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-3 flex-wrap">
+              <p className="font-medium">
+                Compress context{" "}
+                <a
+                  href="https://github.com/chopratejas/headroom"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-xs font-normal text-primary underline hover:opacity-80"
+                >
+                  (Headroom)
+                </a>
+              </p>
+              <span className={`text-xs px-2 py-0.5 rounded ${headroomRunning ? "bg-success/15 text-success" : "bg-warning/15 text-warning"}`}>
+                {headroomStatusLabel}
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowHeadroomInstallModal(true)}
+                className="text-xs text-primary underline hover:opacity-80"
+              >
+                  {headroomRunning ? "Manage" : "Setup"}
+              </button>
+            </div>
+            <p className="text-sm text-text-muted mt-1">
+              Compress prompts via /v1/compress before routing to the model
+            </p>
+          </div>
+          <Toggle
+            checked={headroomEnabled && headroomRunning}
+            disabled={!headroomRunning}
+            onChange={() => handleHeadroomEnabled(!headroomEnabled)}
+          />
+        </div>
+        <div className="flex items-center justify-between pt-4 gap-4 flex-wrap">
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">
+              Compress LLM output{" "}
+              <a
+                href="https://github.com/JuliusBrussee/caveman"
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs font-normal text-primary underline hover:opacity-80"
+              >
+                (Caveman)
+              </a>
+            </p>
+            <p className="text-sm text-text-muted">
+              Terse-style system prompt → ~65% fewer output tokens (up to 87%)
+            </p>
+          </div>
+          <div className="flex items-center gap-3 shrink-0">
+            {cavemanEnabled && (
+              <div className="flex flex-col items-end gap-1">
+                <div className="flex items-center gap-1.5">
+                  {visibleCavemanLevels.map((lvl) => (
+                    <button
+                      key={lvl.id}
+                      onClick={() => handleCavemanLevel(lvl.id)}
+                      className={`px-3 py-1.5 rounded text-xs font-medium border transition-colors ${
+                        cavemanLevel === lvl.id
+                          ? "bg-primary text-white border-primary"
+                          : "bg-transparent border-border text-text-muted hover:bg-surface-2"
+                      }`}
+                      title={lvl.desc}
+                    >
+                      {lvl.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-xs text-primary">
+                  {CAVEMAN_LEVELS.find((lvl) => lvl.id === cavemanLevel)?.desc}
+                </p>
+              </div>
+            )}
+            <Toggle
+              checked={cavemanEnabled}
+              onChange={() => handleCavemanEnabled(!cavemanEnabled)}
+            />
+          </div>
+        </div>
+        <div className="flex items-center justify-between pt-4 mt-4 border-t border-border gap-4 flex-wrap">
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">
+              Lazy senior dev{" "}
+              <a
+                href="https://github.com/DietrichGebert/ponytail"
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs font-normal text-primary underline hover:opacity-80"
+              >
+                (Ponytail)
+              </a>
+            </p>
+            <p className="text-sm text-text-muted">
+              Bias the model toward minimal code: YAGNI, reuse stdlib, deletion over addition
+            </p>
+          </div>
+          <div className="flex items-center gap-3 shrink-0">
+            {ponytailEnabled && (
+              <div className="flex flex-col items-end gap-1">
+                <div className="flex items-center gap-1.5">
+                  {PONYTAIL_LEVELS.map((lvl) => (
+                    <button
+                      key={lvl.id}
+                      onClick={() => handlePonytailLevel(lvl.id)}
+                      className={`px-3 py-1.5 rounded text-xs font-medium border transition-colors ${
+                        ponytailLevel === lvl.id
+                          ? "bg-primary text-white border-primary"
+                          : "bg-transparent border-border text-text-muted hover:bg-surface-2"
+                      }`}
+                      title={lvl.desc}
+                    >
+                      {lvl.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-xs text-primary">
+                  {PONYTAIL_LEVELS.find((lvl) => lvl.id === ponytailLevel)?.desc}
+                </p>
+              </div>
+            )}
+            <Toggle
+              checked={ponytailEnabled}
+              onChange={() => handlePonytailEnabled(!ponytailEnabled)}
+            />
+          </div>
+        </div>
+      </Card>
+
+      {/* Access Policy Modal */}
+      <Modal
+        isOpen={!!accessModalKey}
+        title={`Access for ${accessModalKey?.name || "API Key"}`}
+        onClose={() => !accessSaving && setAccessModalKey(null)}
+      >
+        <div className="flex flex-col gap-4 max-h-[70vh] overflow-y-auto pr-1">
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => setAccessDraft({ mode: "unrestricted", accounts: [], combos: [] })}
+              className={`rounded border px-3 py-2 text-sm ${accessDraft.mode !== "restricted" ? "border-primary bg-primary/10 text-primary" : "border-border hover:bg-surface-2"}`}
+            >
+              Full access
+            </button>
+            <button
+              type="button"
+              onClick={() => setAccessDraft((prev) => ({ ...prev, mode: "restricted" }))}
+              className={`rounded border px-3 py-2 text-sm ${accessDraft.mode === "restricted" ? "border-primary bg-primary/10 text-primary" : "border-border hover:bg-surface-2"}`}
+            >
+              Restricted
+            </button>
+          </div>
+
+          {accessDraft.mode === "restricted" && (
+            <>
+              <div className="flex flex-col gap-2">
+                <p className="text-sm font-medium">Allowed provider accounts</p>
+                <p className="text-xs text-text-muted">Grant accounts by connection ID. Use all models or pick explicit model IDs.</p>
+                <div className="flex flex-col gap-3">
+                  {providerAccounts.map((account) => {
+                    const grant = accessDraft.accounts?.find((item) => item.connectionId === account.id);
+                    const checked = !!grant;
+                    const label = account.displayName || account.name || account.email || account.id;
+                    return (
+                      <div key={account.id} className="rounded border border-border p-3 flex flex-col gap-2">
+                        <label className="flex items-start gap-2 text-sm">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => updateAccountGrant(account.id, e.target.checked ? { models: { mode: "all", ids: [] } } : null)}
+                            className="mt-1"
+                          />
+                          <span className="min-w-0">
+                            <span className="font-medium block truncate">{label}</span>
+                            <span className="text-xs text-text-muted font-mono">{account.provider} · {account.id}</span>
+                          </span>
+                        </label>
+                        {checked && (
+                          <div className="ml-6 flex flex-col gap-2">
+                            <select
+                              value={grant.models?.mode || "all"}
+                              onChange={(e) => updateAccountGrant(account.id, { models: e.target.value === "selected" ? { mode: "selected", ids: grant.models?.ids || [] } : { mode: "all", ids: [] } })}
+                              className="rounded border border-border bg-input px-2 py-1 text-sm"
+                            >
+                              <option value="all">All models on this account</option>
+                              <option value="selected">Explicit model IDs only</option>
+                            </select>
+                            {grant.models?.mode === "selected" && (() => {
+                              const knownModels = getModelsByProviderId(account.provider);
+                              const knownIds = new Set(knownModels.map((model) => model.id));
+                              const manualIds = (grant.models.ids || []).filter((id) => !knownIds.has(id));
+                              return (
+                                <div className="flex flex-col gap-2">
+                                  {knownModels.length > 0 && (
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-1 max-h-48 overflow-y-auto rounded border border-border bg-input/40 p-2">
+                                      {knownModels.map((model) => (
+                                        <label key={model.id} className="flex items-start gap-2 rounded px-2 py-1 text-xs hover:bg-surface-2">
+                                          <input
+                                            type="checkbox"
+                                            checked={(grant.models.ids || []).includes(model.id)}
+                                            onChange={(e) => toggleSelectedModelId(account.id, grant, model.id, e.target.checked)}
+                                            className="mt-0.5"
+                                          />
+                                          <span className="min-w-0">
+                                            <span className="block truncate font-mono">{model.id}</span>
+                                            {model.name && model.name !== model.id && (
+                                              <span className="block truncate text-text-muted">{model.name}</span>
+                                            )}
+                                          </span>
+                                        </label>
+                                      ))}
+                                    </div>
+                                  )}
+                                  <textarea
+                                    value={manualIds.join("\n")}
+                                    onChange={(e) => {
+                                      const nextManual = e.target.value.split(/[\n,]+/).map((v) => v.trim()).filter(Boolean);
+                                      const checkedKnown = (grant.models.ids || []).filter((id) => knownIds.has(id));
+                                      setSelectedModelIds(account.id, [...checkedKnown, ...nextManual]);
+                                    }}
+                                    placeholder="Other model IDs, one per line or comma-separated"
+                                    className="min-h-16 rounded border border-border bg-input px-2 py-1 text-sm font-mono"
+                                  />
+                                </div>
+                              );
+                            })()}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <p className="text-sm font-medium">Allowed combos</p>
+                <p className="text-xs text-text-muted">Combo grants expose combo names. Underlying models still require allowed accounts above.</p>
+                {combos.length === 0 ? (
+                  <p className="text-sm text-text-muted">No combos configured.</p>
+                ) : (
+                  <div className="grid grid-cols-1 gap-2">
+                    {combos.map((combo) => (
+                      <label key={combo.id || combo.name} className="flex items-center gap-2 text-sm rounded border border-border p-2">
+                        <input
+                          type="checkbox"
+                          checked={(accessDraft.combos || []).includes(combo.name)}
+                          onChange={(e) => toggleComboGrant(combo.name, e.target.checked)}
+                        />
+                        <span className="font-medium">{combo.name}</span>
+                        <span className="text-xs text-text-muted">{combo.models?.length || 0} models</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+
+          <div className="flex gap-2 pt-2">
+            <Button onClick={saveAccessPolicy} fullWidth disabled={accessSaving}>
+              {accessSaving ? "Saving..." : "Save access"}
+            </Button>
+            <Button onClick={() => setAccessModalKey(null)} variant="ghost" fullWidth disabled={accessSaving}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      </Modal>
 
       {/* Add Key Modal */}
       <Modal

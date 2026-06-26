@@ -3,9 +3,9 @@ import {
   markAccountUnavailable,
   clearAccountError,
   extractApiKey,
-  isValidApiKey,
+  getApiKeyContext,
 } from "../services/auth.js";
-import { getSettings } from "@/lib/localDb";
+import { getProviderConnections, getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleImageGenerationCore } from "open-sse/handlers/imageGenerationCore.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
@@ -13,7 +13,7 @@ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { handleComboChat } from "open-sse/services/combo.js";
 import * as log from "../utils/logger.js";
-
+import { ApiKeyAccessDeniedError, accessDeniedResponse, accountScopedAccessPolicy, filterAllowedComboModels, hasAssignedAccounts, isComboAllowed, isUnrestricted } from "@/lib/access/apiKeyAccessPolicy.js";
 // Providers that don't require credentials (noAuth)
 const NO_AUTH_PROVIDERS = new Set(["sdwebui", "comfyui"]);
 
@@ -37,10 +37,11 @@ export async function handleImageGeneration(request) {
 
   const apiKey = extractApiKey(request);
   const settings = await getSettings();
+  let apiKeyContext = { rawKey: apiKey, apiKey: null, accessPolicy: null };
+  if (apiKey) apiKeyContext = await getApiKeyContext(apiKey);
   if (settings.requireApiKey) {
     if (!apiKey) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
+    if (!apiKeyContext.apiKey) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
   }
 
   if (!modelStr) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
@@ -49,14 +50,18 @@ export async function handleImageGeneration(request) {
   // Combo expansion: model may be a combo name → run fallback/round-robin across models
   const comboModels = await getComboModels(modelStr);
   if (comboModels) {
+    const comboAccess = await authorizeComboAccess(apiKeyContext.accessPolicy, modelStr, comboModels);
+    if (comboAccess.response) return comboAccess.response;
+    const allowedComboModels = comboAccess.models;
+    const comboAccessPolicy = accountScopedAccessPolicy(apiKeyContext.accessPolicy);
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[modelStr]?.fallbackStrategy || settings.comboStrategy || "fallback";
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
-    log.info("IMAGE", `Combo "${modelStr}" with ${comboModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
+    log.info("IMAGE", `Combo "${modelStr}" with ${allowedComboModels.length}/${comboModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
     return handleComboChat({
       body,
-      models: comboModels,
-      handleSingleModel: (b, m) => handleSingleModelImage(b, m, { wantsStream, binaryOutput, preferredConnectionId }),
+      models: allowedComboModels,
+      handleSingleModel: (b, m) => handleSingleModelImage(b, m, { wantsStream, binaryOutput, preferredConnectionId, apiKeyContext: { ...apiKeyContext, accessPolicy: comboAccessPolicy } }),
       log,
       comboName: modelStr,
       comboStrategy,
@@ -64,10 +69,25 @@ export async function handleImageGeneration(request) {
     });
   }
 
-  return handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId });
+  return handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId, apiKeyContext });
 }
 
-async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId } = {}) {
+async function authorizeComboAccess(accessPolicy, comboName, comboModels) {
+  if (!isComboAllowed(accessPolicy, comboName)) {
+    return { response: accessDeniedResponse(new ApiKeyAccessDeniedError(`API key is not authorized for combo: ${comboName}`)), models: [] };
+  }
+  const connections = await getProviderConnections();
+  const allowedModels = await filterAllowedComboModels(accessPolicy, comboModels, getModelInfo, connections, { accountScoped: true });
+  if (allowedModels.length === 0) {
+    const message = hasAssignedAccounts(accessPolicy)
+      ? `No allowed models for combo: ${comboName}`
+      : `No accounts assigned for combo: ${comboName}`;
+    return { response: accessDeniedResponse(new ApiKeyAccessDeniedError(message)), models: [] };
+  }
+  return { response: null, models: allowedModels };
+}
+
+async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId, apiKeyContext } = {}) {
   const modelInfo = await getModelInfo(modelStr);
   if (!modelInfo.provider) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
 
@@ -75,6 +95,9 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
 
   // noAuth providers — no credential needed
   if (NO_AUTH_PROVIDERS.has(provider)) {
+    if (!isUnrestricted(apiKeyContext?.accessPolicy)) {
+      return accessDeniedResponse(new ApiKeyAccessDeniedError(`API key is not authorized for provider: ${provider}`));
+    }
     const result = await handleImageGenerationCore({
       body,
       modelInfo: { provider, model },
@@ -91,7 +114,13 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { preferredConnectionId });
+    let credentials;
+    try {
+      credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { preferredConnectionId, accessPolicy: apiKeyContext?.accessPolicy });
+    } catch (error) {
+      if (error instanceof ApiKeyAccessDeniedError) return accessDeniedResponse(error);
+      throw error;
+    }
 
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {

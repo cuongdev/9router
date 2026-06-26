@@ -5,10 +5,10 @@ import {
   markAccountUnavailable,
   clearAccountError,
   extractApiKey,
-  isValidApiKey,
+  getApiKeyContext,
 } from "../services/auth.js";
 import { cacheClaudeHeaders } from "open-sse/utils/claudeHeaderCache.js";
-import { getSettings } from "@/lib/localDb";
+import { getProviderConnections, getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
 import { DEFAULT_HEADROOM_URL } from "@/lib/headroom/detect";
@@ -20,7 +20,7 @@ import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
-
+import { ApiKeyAccessDeniedError, accessDeniedResponse, accountScopedAccessPolicy, filterAllowedComboModels, hasAssignedAccounts, isComboAllowed } from "@/lib/access/apiKeyAccessPolicy.js";
 /**
  * Handle chat completion request
  * Supports: OpenAI, Claude, Gemini, OpenAI Responses API formats
@@ -68,13 +68,14 @@ export async function handleChat(request, clientRawRequest = null) {
 
   // Enforce API key if enabled in settings
   const settings = await getSettings();
+  let apiKeyContext = { rawKey: apiKey, apiKey: null, accessPolicy: null };
+  if (apiKey) apiKeyContext = await getApiKeyContext(apiKey);
   if (settings.requireApiKey) {
     if (!apiKey) {
       log.warn("AUTH", "Missing API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
     }
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) {
+    if (!apiKeyContext.apiKey) {
       log.warn("AUTH", "Invalid API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
     }
@@ -93,23 +94,27 @@ export async function handleChat(request, clientRawRequest = null) {
   // Check if model is a combo (has multiple models with fallback)
   const comboModels = await getComboModels(modelStr);
   if (comboModels) {
+    const comboAccess = await authorizeComboAccess(apiKeyContext.accessPolicy, modelStr, comboModels);
+    if (comboAccess.response) return comboAccess.response;
+    const allowedComboModels = comboAccess.models;
+    const comboAccessPolicy = accountScopedAccessPolicy(apiKeyContext.accessPolicy);
     // Check for combo-specific strategy first, fallback to global
     const comboStrategies = settings.comboStrategies || {};
     const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
     const comboStrategy = comboSpecificStrategy || settings.comboStrategy || "fallback";
 
     if (comboStrategy === "fusion") {
-      log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
+      log.info("CHAT", `Combo "${modelStr}" with ${allowedComboModels.length}/${comboModels.length} models (strategy: fusion)`);
       return handleFusionChat({
         body,
-        models: comboModels,
+        models: allowedComboModels,
         handleSingleModel: (b, m, isPanel) => {
           let cleanRawReq = clientRawRequest;
           if (isPanel && clientRawRequest) {
             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
             cleanRawReq = { ...clientRawRequest, body: cleanBody };
           }
-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, { ...apiKeyContext, accessPolicy: comboAccessPolicy });
         },
         log,
         comboName: modelStr,
@@ -119,11 +124,11 @@ export async function handleChat(request, clientRawRequest = null) {
     }
 
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
-    log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
+    log.info("CHAT", `Combo "${modelStr}" with ${allowedComboModels.length}/${comboModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
     return handleComboChat({
       body,
-      models: comboModels,
-      handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+      models: allowedComboModels,
+      handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, { ...apiKeyContext, accessPolicy: comboAccessPolicy }),
       log,
       comboName: modelStr,
       comboStrategy,
@@ -132,19 +137,38 @@ export async function handleChat(request, clientRawRequest = null) {
   }
 
   // Single model request
-  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey);
+  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, apiKeyContext);
 }
 
 /**
  * Handle single model chat request
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null) {
+async function authorizeComboAccess(accessPolicy, comboName, comboModels) {
+  if (!isComboAllowed(accessPolicy, comboName)) {
+    return { response: accessDeniedResponse(new ApiKeyAccessDeniedError(`API key is not authorized for combo: ${comboName}`)), models: [] };
+  }
+  const connections = await getProviderConnections();
+  const allowedModels = await filterAllowedComboModels(accessPolicy, comboModels, getModelInfo, connections, { accountScoped: true });
+  if (allowedModels.length === 0) {
+    const message = hasAssignedAccounts(accessPolicy)
+      ? `No allowed models for combo: ${comboName}`
+      : `No accounts assigned for combo: ${comboName}`;
+    return { response: accessDeniedResponse(new ApiKeyAccessDeniedError(message)), models: [] };
+  }
+  return { response: null, models: allowedModels };
+}
+
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, apiKeyContext = null) {
   const modelInfo = await getModelInfo(modelStr);
 
   // If provider is null, this might be a combo name - check and handle
   if (!modelInfo.provider) {
     const comboModels = await getComboModels(modelStr);
     if (comboModels) {
+      const comboAccess = await authorizeComboAccess(apiKeyContext?.accessPolicy, modelStr, comboModels);
+      if (comboAccess.response) return comboAccess.response;
+      const allowedComboModels = comboAccess.models;
+      const comboAccessPolicy = accountScopedAccessPolicy(apiKeyContext?.accessPolicy);
       const chatSettings = await getSettings();
       // Check for combo-specific strategy first, fallback to global
       const comboStrategies = chatSettings.comboStrategies || {};
@@ -152,17 +176,17 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       const comboStrategy = comboSpecificStrategy || chatSettings.comboStrategy || "fallback";
 
       if (comboStrategy === "fusion") {
-        log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
+        log.info("CHAT", `Combo "${modelStr}" with ${allowedComboModels.length}/${comboModels.length} models (strategy: fusion)`);
         return handleFusionChat({
           body,
-          models: comboModels,
+          models: allowedComboModels,
           handleSingleModel: (b, m, isPanel) => {
             let cleanRawReq = clientRawRequest;
             if (isPanel && clientRawRequest) {
               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
               cleanRawReq = { ...clientRawRequest, body: cleanBody };
             }
-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, { ...apiKeyContext, accessPolicy: comboAccessPolicy });
           },
           log,
           comboName: modelStr,
@@ -172,11 +196,11 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       }
 
       const comboStickyLimit = chatSettings.comboStickyRoundRobinLimit;
-      log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
+      log.info("CHAT", `Combo "${modelStr}" with ${allowedComboModels.length}/${comboModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
       return handleComboChat({
         body,
-        models: comboModels,
-        handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+        models: allowedComboModels,
+        handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, { ...apiKeyContext, accessPolicy: comboAccessPolicy }),
         log,
         comboName: modelStr,
         comboStrategy,
@@ -205,7 +229,13 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
+    let credentials;
+    try {
+      credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { accessPolicy: apiKeyContext?.accessPolicy });
+    } catch (error) {
+      if (error instanceof ApiKeyAccessDeniedError) return accessDeniedResponse(error);
+      throw error;
+    }
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {

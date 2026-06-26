@@ -5,7 +5,10 @@ import {
   isAnthropicCompatibleProvider,
   isOpenAICompatibleProvider,
 } from "@/shared/constants/providers";
-import { getProviderConnections, getCombos, getCustomModels, getModelAliases } from "@/lib/localDb";
+import { getProviderConnections, getCombos, getCustomModels, getModelAliases, getSettings } from "@/lib/localDb";
+import { getApiKeyContext, extractApiKey } from "@/sse/services/auth.js";
+import { canAccessProviderModel, isComboAllowed, isUnrestricted } from "@/lib/access/apiKeyAccessPolicy.js";
+import { getModelInfo } from "@/sse/services/model.js";
 import { getDisabledModels } from "@/lib/disabledModelsDb";
 import { resolveKiroModels } from "open-sse/services/kiroModels.js";
 import { resolveQoderModels } from "open-sse/services/qoderModels.js";
@@ -67,6 +70,7 @@ const UPSTREAM_CONNECTION_RE = /[-_][0-9a-f]{8,}$/i;
 
 // LLM kind sentinel — combos/models with no explicit kind default to LLM
 const LLM_KIND = "llm";
+const RUNTIME_NO_AUTH_PROVIDERS = new Set(["sdwebui", "comfyui"]);
 
 // Map per-model `type` field (in PROVIDER_MODELS) to service kind.
 // Models without `type` are treated as LLM.
@@ -77,6 +81,19 @@ const MODEL_TYPE_TO_KIND = {
   stt: "stt",
   imageToText: "imageToText",
 };
+
+export async function getDiscoveryAccessPolicy(request) {
+  const apiKey = extractApiKey(request);
+  const settings = await getSettings();
+  if (!apiKey) {
+    return settings.requireApiKey ? { mode: "restricted", accounts: [], combos: [] } : null;
+  }
+  const apiKeyContext = await getApiKeyContext(apiKey);
+  if (!apiKeyContext.apiKey) {
+    return { mode: "restricted", accounts: [], combos: [] };
+  }
+  return apiKeyContext.accessPolicy;
+}
 
 function modelKind(model) {
   const k = model?.kind || model?.type;
@@ -172,7 +189,7 @@ function comboMatchesKinds(combo, kindFilter) {
  * Build OpenAI-format models list filtered by service kinds.
  * @param {string[]} kindFilter - List of service kinds to include (e.g. ["llm"], ["webSearch","webFetch"]).
  */
-export async function buildModelsList(kindFilter) {
+export async function buildModelsList(kindFilter, accessPolicy = null) {
   let connections = [];
   try {
     connections = await getProviderConnections();
@@ -222,6 +239,7 @@ export async function buildModelsList(kindFilter) {
   // Combos first (filtered by kind). Web combos expose `kind` so AI knows search vs fetch.
   for (const combo of combos) {
     if (!comboMatchesKinds(combo, kindFilter)) continue;
+    if (!isComboAllowed(accessPolicy, combo.name)) continue;
     const entry = {
       id: combo.name,
       object: "model",
@@ -234,6 +252,7 @@ export async function buildModelsList(kindFilter) {
   }
 
   if (connections.length === 0) {
+    if (!isUnrestricted(accessPolicy)) return models;
     // DB unavailable -> return static models, filtered by per-model kind
     const aliasToProviderId = Object.fromEntries(
       Object.entries(PROVIDER_ID_TO_ALIAS).map(([id, alias]) => [alias, id])
@@ -378,6 +397,7 @@ export async function buildModelsList(kindFilter) {
       const mergedModelIds = Array.from(new Set([...modelIds, ...customModelIds, ...aliasModelIds]));
 
       for (const modelId of mergedModelIds) {
+        if (!canAccessProviderModel(accessPolicy, connections, providerId, modelId)) continue;
         // Resolve kind: prefer static/custom metadata, otherwise infer from ID heuristics
         const customKind = customModelKindById.get(modelId);
         const kind = staticModelKindById.get(modelId) || customKind || inferKindFromUnknownModelId(modelId);
@@ -398,7 +418,7 @@ export async function buildModelsList(kindFilter) {
 
       // Web search/fetch — provider IS the model, expose as {alias}/search and/or {alias}/fetch with explicit kind
       const providerInfo = AI_PROVIDERS[providerId];
-      if (kindFilter.includes("webSearch") && providerInfo?.searchConfig) {
+      if (kindFilter.includes("webSearch") && providerInfo?.searchConfig && canAccessProviderModel(accessPolicy, connections, providerId, "search")) {
         models.push({
           id: `${outputAlias}/search`,
           object: "model",
@@ -406,7 +426,45 @@ export async function buildModelsList(kindFilter) {
           owned_by: outputAlias,
         });
       }
-      if (kindFilter.includes("webFetch") && providerInfo?.fetchConfig) {
+      if (kindFilter.includes("webFetch") && providerInfo?.fetchConfig && canAccessProviderModel(accessPolicy, connections, providerId, "fetch")) {
+        models.push({
+          id: `${outputAlias}/fetch`,
+          object: "model",
+          kind: "webFetch",
+          owned_by: outputAlias,
+        });
+      }
+    }
+  }
+
+  if (isUnrestricted(accessPolicy)) {
+    const connectedProviderIds = new Set(activeConnectionByProvider.keys());
+    for (const [providerId, providerInfo] of Object.entries(AI_PROVIDERS)) {
+      if (!(providerInfo?.noAuth || RUNTIME_NO_AUTH_PROVIDERS.has(providerId)) || connectedProviderIds.has(providerId)) continue;
+      if (!providerMatchesKinds(providerId, kindFilter)) continue;
+      const outputAlias = getProviderAlias(providerId) || providerId;
+      const staticAlias = PROVIDER_ID_TO_ALIAS[providerId] || providerId;
+      const providerModels = PROVIDER_MODELS[staticAlias] || [];
+
+      for (const model of providerModels) {
+        if (!kindFilter.includes(modelKind(model))) continue;
+        if (isDisabled(outputAlias, model.id) || isDisabled(staticAlias, model.id)) continue;
+        models.push({
+          id: `${outputAlias}/${model.id}`,
+          object: "model",
+          owned_by: outputAlias,
+        });
+      }
+
+      if (kindFilter.includes("webSearch") && providerInfo.searchConfig) {
+        models.push({
+          id: `${outputAlias}/search`,
+          object: "model",
+          kind: "webSearch",
+          owned_by: outputAlias,
+        });
+      }
+      if (kindFilter.includes("webFetch") && providerInfo.fetchConfig) {
         models.push({
           id: `${outputAlias}/fetch`,
           object: "model",
@@ -445,9 +503,9 @@ export async function OPTIONS() {
  * GET /v1/models - OpenAI compatible models list (LLM/chat models only by default).
  * For other capabilities use /v1/models/{kind} (image, tts, stt, embedding, image-to-text, web).
  */
-export async function GET() {
+export async function GET(request) {
   try {
-    const data = await buildModelsList([LLM_KIND]);
+    const data = await buildModelsList([LLM_KIND], await getDiscoveryAccessPolicy(request));
     return Response.json({ object: "list", data }, {
       headers: { "Access-Control-Allow-Origin": "*" },
     });

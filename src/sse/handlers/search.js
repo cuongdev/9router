@@ -3,9 +3,9 @@ import {
   markAccountUnavailable,
   clearAccountError,
   extractApiKey,
-  isValidApiKey,
+  getApiKeyContext,
 } from "../services/auth.js";
-import { getSettings, getCombos } from "@/lib/localDb";
+import { getProviderConnections, getSettings, getCombos } from "@/lib/localDb";
 import { AI_PROVIDERS, resolveProviderId } from "@/shared/constants/providers.js";
 import { handleSearchCore } from "open-sse/handlers/search/index.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
@@ -13,7 +13,7 @@ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo.js";
-
+import { ApiKeyAccessDeniedError, accessDeniedResponse, accountScopedAccessPolicy, filterAllowedComboModels, hasAssignedAccounts, isComboAllowed, isUnrestricted } from "@/lib/access/apiKeyAccessPolicy.js";
 /**
  * Handle web search request for the SSE/Next.js server.
  * Provider IS the model (no model field). Mirrors handleEmbeddings auth + fallback flow.
@@ -46,13 +46,14 @@ export async function handleSearch(request) {
 
   // Enforce API key if enabled in settings
   const settings = await getSettings();
+  let apiKeyContext = { rawKey: apiKey, apiKey: null, accessPolicy: null };
+  if (apiKey) apiKeyContext = await getApiKeyContext(apiKey);
   if (settings.requireApiKey) {
     if (!apiKey) {
       log.warn("AUTH", "Missing API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
     }
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) {
+    if (!apiKeyContext.apiKey) {
       log.warn("AUTH", "Invalid API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
     }
@@ -72,14 +73,18 @@ export async function handleSearch(request) {
   const combos = await getCombos();
   const comboModels = getComboModelsFromData(providerInput, combos);
   if (comboModels) {
+    const comboAccess = await authorizeComboAccess(apiKeyContext.accessPolicy, providerInput, comboModels);
+    if (comboAccess.response) return comboAccess.response;
+    const allowedComboModels = comboAccess.models;
+    const comboAccessPolicy = accountScopedAccessPolicy(apiKeyContext.accessPolicy);
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[providerInput]?.fallbackStrategy || settings.comboStrategy || "fallback";
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
-    log.info("SEARCH", `Combo "${providerInput}" with ${comboModels.length} providers (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
+    log.info("SEARCH", `Combo "${providerInput}" with ${allowedComboModels.length}/${comboModels.length} providers (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
     return handleComboChat({
       body,
-      models: comboModels,
-      handleSingleModel: (b, m) => handleSingleProviderSearch(b, m, request, apiKey, settings),
+      models: allowedComboModels,
+      handleSingleModel: (b, m) => handleSingleProviderSearch(b, m, request, apiKey, settings, { ...apiKeyContext, accessPolicy: comboAccessPolicy }),
       log,
       comboName: providerInput,
       comboStrategy,
@@ -87,10 +92,25 @@ export async function handleSearch(request) {
     });
   }
 
-  return handleSingleProviderSearch(body, providerInput, request, apiKey, settings);
+  return handleSingleProviderSearch(body, providerInput, request, apiKey, settings, apiKeyContext);
 }
 
-async function handleSingleProviderSearch(body, providerInput, request, apiKey, settings) {
+async function authorizeComboAccess(accessPolicy, comboName, comboModels) {
+  if (!isComboAllowed(accessPolicy, comboName)) {
+    return { response: accessDeniedResponse(new ApiKeyAccessDeniedError(`API key is not authorized for combo: ${comboName}`)), models: [] };
+  }
+  const connections = await getProviderConnections();
+  const allowedModels = await filterAllowedComboModels(accessPolicy, comboModels, getModelInfo, connections, { defaultModel: "search", accountScoped: true });
+  if (allowedModels.length === 0) {
+    const message = hasAssignedAccounts(accessPolicy)
+      ? `No allowed models for combo: ${comboName}`
+      : `No accounts assigned for combo: ${comboName}`;
+    return { response: accessDeniedResponse(new ApiKeyAccessDeniedError(message)), models: [] };
+  }
+  return { response: null, models: allowedModels };
+}
+
+async function handleSingleProviderSearch(body, providerInput, request, apiKey, settings, apiKeyContext) {
   const query = body.query;
   const providerId = resolveProviderId(providerInput);
   const resolvedProvider = AI_PROVIDERS[providerId];
@@ -131,6 +151,9 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
 
   // No-auth providers (e.g. searxng) bypass credential lookup
   if (resolvedProvider.noAuth) {
+    if (!isUnrestricted(apiKeyContext?.accessPolicy)) {
+      return accessDeniedResponse(new ApiKeyAccessDeniedError(`API key is not authorized for provider: ${providerId}`));
+    }
     log.info("AUTH", `\x1b[32m${providerId} no-auth mode\x1b[0m`);
     const result = await handleSearchCore({
       body: coreBody,
@@ -149,7 +172,13 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(providerId, excludeConnectionIds);
+    let credentials;
+    try {
+      credentials = await getProviderCredentials(providerId, excludeConnectionIds, "search", { accessPolicy: apiKeyContext?.accessPolicy });
+    } catch (error) {
+      if (error instanceof ApiKeyAccessDeniedError) return accessDeniedResponse(error);
+      throw error;
+    }
 
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {

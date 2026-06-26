@@ -1,4 +1,5 @@
-import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings } from "@/lib/localDb";
+import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getActiveApiKeyByKey } from "@/lib/localDb";
+import { filterAllowedConnections, isUnrestricted, ApiKeyAccessDeniedError } from "@/lib/access/apiKeyAccessPolicy.js";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
@@ -37,6 +38,9 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       const settings = await getSettings();
       const override = (settings.providerStrategies || {})[providerId] || {};
       const resolvedProxy = await resolveConnectionProxyConfig({ proxyPoolId: override.proxyPoolId || "" });
+      if (!isUnrestricted(options?.accessPolicy)) {
+        throw new ApiKeyAccessDeniedError(`API key is not authorized for provider: ${providerId}`);
+      }
       return {
         id: "noauth",
         connectionName: "Public",
@@ -60,8 +64,13 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       return null;
     }
 
-    // Filter out model-locked and excluded connections
-    const availableConnections = connections.filter(c => {
+    const policyAllowedConnections = filterAllowedConnections(options?.accessPolicy, connections, model);
+    if (policyAllowedConnections.length === 0) {
+      throw new ApiKeyAccessDeniedError(`API key is not authorized for ${providerId}${model ? `/${model}` : ""}`);
+    }
+
+    // Filter out model-locked and excluded connections after policy filtering so fallback never reaches unauthorized accounts.
+    const availableConnections = policyAllowedConnections.filter(c => {
       if (excludeSet.has(c.id)) return false;
       if (isModelLockActive(c, model)) return false;
       return true;
@@ -79,7 +88,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
 
     if (availableConnections.length === 0) {
       // Find earliest lock expiry across all connections for retry timing
-      const lockedConns = connections.filter(c => isModelLockActive(c, model));
+      const lockedConns = policyAllowedConnections.filter(c => isModelLockActive(c, model));
       const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);
       const earliest = expiries.sort()[0] || null;
       if (earliest) {
@@ -309,4 +318,14 @@ export function extractApiKey(request) {
 export async function isValidApiKey(apiKey) {
   if (!apiKey) return false;
   return await validateApiKey(apiKey);
+}
+
+export async function getApiKeyContext(rawKey) {
+  if (!rawKey) return { rawKey: null, apiKey: null, accessPolicy: null };
+  const apiKey = await getActiveApiKeyByKey(rawKey);
+  return {
+    rawKey,
+    apiKey,
+    accessPolicy: apiKey?.accessPolicy || { mode: "restricted", accounts: [], combos: [] },
+  };
 }

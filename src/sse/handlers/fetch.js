@@ -3,9 +3,9 @@ import {
   markAccountUnavailable,
   clearAccountError,
   extractApiKey,
-  isValidApiKey,
+  getApiKeyContext,
 } from "../services/auth.js";
-import { getSettings, getCombos } from "@/lib/localDb";
+import { getProviderConnections, getSettings, getCombos } from "@/lib/localDb";
 import { AI_PROVIDERS, resolveProviderId } from "@/shared/constants/providers.js";
 import { handleFetchCore } from "open-sse/handlers/fetch/index.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
@@ -14,7 +14,7 @@ import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo.js";
 import { assertPublicUrl } from "@/shared/utils/ssrfGuard.js";
-
+import { ApiKeyAccessDeniedError, accessDeniedResponse, accountScopedAccessPolicy, filterAllowedComboModels, hasAssignedAccounts, isComboAllowed, isUnrestricted } from "@/lib/access/apiKeyAccessPolicy.js";
 /**
  * Handle web fetch (URL extraction) request for the SSE/Next.js server.
  * Provider IS the model. Mirrors handleEmbeddings auth + fallback flow.
@@ -49,13 +49,14 @@ export async function handleFetch(request) {
 
   // Enforce API key if enabled in settings
   const settings = await getSettings();
+  let apiKeyContext = { rawKey: apiKey, apiKey: null, accessPolicy: null };
+  if (apiKey) apiKeyContext = await getApiKeyContext(apiKey);
   if (settings.requireApiKey) {
     if (!apiKey) {
       log.warn("AUTH", "Missing API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
     }
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) {
+    if (!apiKeyContext.apiKey) {
       log.warn("AUTH", "Invalid API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
     }
@@ -91,14 +92,18 @@ export async function handleFetch(request) {
   const combos = await getCombos();
   const comboModels = getComboModelsFromData(providerInput, combos);
   if (comboModels) {
+    const comboAccess = await authorizeComboAccess(apiKeyContext.accessPolicy, providerInput, comboModels);
+    if (comboAccess.response) return comboAccess.response;
+    const allowedComboModels = comboAccess.models;
+    const comboAccessPolicy = accountScopedAccessPolicy(apiKeyContext.accessPolicy);
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[providerInput]?.fallbackStrategy || settings.comboStrategy || "fallback";
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
-    log.info("FETCH", `Combo "${providerInput}" with ${comboModels.length} providers (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
+    log.info("FETCH", `Combo "${providerInput}" with ${allowedComboModels.length}/${comboModels.length} providers (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
     return handleComboChat({
       body,
-      models: comboModels,
-      handleSingleModel: (b, m) => handleSingleProviderFetch(b, m, request, apiKey, settings),
+      models: allowedComboModels,
+      handleSingleModel: (b, m) => handleSingleProviderFetch(b, m, request, apiKey, settings, { ...apiKeyContext, accessPolicy: comboAccessPolicy }),
       log,
       comboName: providerInput,
       comboStrategy,
@@ -106,10 +111,25 @@ export async function handleFetch(request) {
     });
   }
 
-  return handleSingleProviderFetch(body, providerInput, request, apiKey, settings);
+  return handleSingleProviderFetch(body, providerInput, request, apiKey, settings, apiKeyContext);
 }
 
-async function handleSingleProviderFetch(body, providerInput, request, apiKey, settings) {
+async function authorizeComboAccess(accessPolicy, comboName, comboModels) {
+  if (!isComboAllowed(accessPolicy, comboName)) {
+    return { response: accessDeniedResponse(new ApiKeyAccessDeniedError(`API key is not authorized for combo: ${comboName}`)), models: [] };
+  }
+  const connections = await getProviderConnections();
+  const allowedModels = await filterAllowedComboModels(accessPolicy, comboModels, getModelInfo, connections, { defaultModel: "fetch", accountScoped: true });
+  if (allowedModels.length === 0) {
+    const message = hasAssignedAccounts(accessPolicy)
+      ? `No allowed models for combo: ${comboName}`
+      : `No accounts assigned for combo: ${comboName}`;
+    return { response: accessDeniedResponse(new ApiKeyAccessDeniedError(message)), models: [] };
+  }
+  return { response: null, models: allowedModels };
+}
+
+async function handleSingleProviderFetch(body, providerInput, request, apiKey, settings, apiKeyContext) {
   const targetUrl = body.url;
   const format = body.format;
   const maxCharacters = body.max_characters;
@@ -135,6 +155,9 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
 
   // No-auth fetch path (kept for parity though no current fetch provider sets noAuth)
   if (resolvedProvider.noAuth) {
+    if (!isUnrestricted(apiKeyContext?.accessPolicy)) {
+      return accessDeniedResponse(new ApiKeyAccessDeniedError(`API key is not authorized for provider: ${providerId}`));
+    }
     log.info("AUTH", `\x1b[32m${providerId} no-auth mode\x1b[0m`);
     const result = await handleFetchCore({
       url: targetUrl,
@@ -159,7 +182,13 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(providerId, excludeConnectionIds);
+    let credentials;
+    try {
+      credentials = await getProviderCredentials(providerId, excludeConnectionIds, "fetch", { accessPolicy: apiKeyContext?.accessPolicy });
+    } catch (error) {
+      if (error instanceof ApiKeyAccessDeniedError) return accessDeniedResponse(error);
+      throw error;
+    }
 
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
