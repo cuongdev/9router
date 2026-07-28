@@ -41,7 +41,7 @@ export async function GET(request, { params }) {
       );
     }
 
-    const data = await buildModelsList(kindFilter, await getDiscoveryAccessPolicy(request));
+    const data = await buildModelsList(kindFilter, { accessPolicy: await getDiscoveryAccessPolicy(request) });
     return Response.json({ object: "list", data }, {
       headers: { "Access-Control-Allow-Origin": "*" },
     });

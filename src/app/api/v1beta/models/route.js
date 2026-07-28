@@ -20,7 +20,7 @@ export async function OPTIONS() {
 export async function GET(request) {
   try {
     // Access-policy-filtered discovery list (combos + connected provider models).
-    const visibleModels = await buildModelsList(["llm"], await getDiscoveryAccessPolicy(request));
+    const visibleModels = await buildModelsList(["llm"], { accessPolicy: await getDiscoveryAccessPolicy(request) });
     const models = [];
     const seen = new Set();
 

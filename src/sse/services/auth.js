@@ -1,6 +1,6 @@
-import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getActiveApiKeyByKey } from "@/lib/localDb";
+import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getActiveApiKeyByKey, getProxyPools } from "@/lib/localDb";
 import { filterAllowedConnections, isUnrestricted, ApiKeyAccessDeniedError } from "@/lib/access/apiKeyAccessPolicy.js";
-import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
+import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
@@ -37,10 +37,17 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     if (FREE_PROVIDERS[providerId]?.noAuth) {
       const settings = await getSettings();
       const override = (settings.providerStrategies || {})[providerId] || {};
-      const resolvedProxy = await resolveConnectionProxyConfig({ proxyPoolId: override.proxyPoolId || "" });
       if (!isUnrestricted(options?.accessPolicy)) {
         throw new ApiKeyAccessDeniedError(`API key is not authorized for provider: ${providerId}`);
       }
+      const strategy = override.rotateStrategy || "none";
+      let pickedId = override.proxyPoolId || null;
+      if (strategy !== "none") {
+        const allPools = await getProxyPools({ isActive: true });
+        const poolIds = allPools.filter(p => p.proxyUrl).map(p => p.id);
+        pickedId = pickProxyPoolId(poolIds, strategy, providerId);
+      }
+      const resolvedProxy = await resolveConnectionProxyConfig({ proxyPoolId: pickedId || "" });
       return {
         id: "noauth",
         connectionName: "Public",

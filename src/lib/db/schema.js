@@ -1,4 +1,9 @@
-// Latest schema version — bumped when a migration is added in ./migrations/
+// ⚠️ AGENT/DEV: Bump this by +1 EVERY TIME you change the schema below
+// (add/remove/alter a table, column, or index in TABLES). It drives the
+// pre-change safety backup in migrate.js: when the stored version is lower,
+// one lightweight DB backup is taken before applying schema changes. Forgetting
+// to bump only skips that backup — it does NOT break the additive auto-sync.
+// Bumped to 2 for the per-API-key access-policy migration (002).
 export const SCHEMA_VERSION = 2;
 
 export const PRAGMA_SQL = `

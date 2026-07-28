@@ -3,19 +3,20 @@ export default {
   priority: 10,
   alias: "alicode-intl",
   display: {
-    name: "Alibaba Intl",
+    name: "Alibaba Coding",
     icon: "cloud",
     color: "#FF6A00",
     textIcon: "ALi",
-    website: "https://modelstudio.console.alibabacloud.com",
+    website: "https://www.alibabacloud.com/product/coding",
     notice: {
-      apiKeyUrl: "https://modelstudio.console.alibabacloud.com/?apiKey=1",
+      apiKeyUrl: "https://www.alibabacloud.com/product/coding",
     },
   },
   category: "apikey",
   transport: {
     baseUrl: "https://coding-intl.dashscope.aliyuncs.com/v1/chat/completions",
     headers: {},
+    quirks: { preserveCacheControl: true },
   },
   models: [
     { id: "qwen3.5-plus", name: "Qwen3.5 Plus" },

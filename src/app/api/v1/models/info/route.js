@@ -96,7 +96,7 @@ export async function GET(request) {
   }
   const info = lookup(id, kind);
   if (info) {
-    const visible = await buildModelsList([kind || info.kind || "llm"], await getDiscoveryAccessPolicy(request));
+    const visible = await buildModelsList([kind || info.kind || "llm"], { accessPolicy: await getDiscoveryAccessPolicy(request) });
     if (!visible.some((model) => model.id === id)) {
       return Response.json(
         { error: { message: `Model not found: ${id}`, type: "not_found" } },
