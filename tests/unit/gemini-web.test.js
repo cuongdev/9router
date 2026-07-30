@@ -153,6 +153,11 @@ describe("resolveGeminiModel", () => {
     const resolved = resolveGeminiModel("not-a-real-model", models);
     expect(resolved.hashId).toBe("56fdd199312815e2");
   });
+
+  it("returns a synthetic no-op model when modelList is empty", () => {
+    const resolved = resolveGeminiModel("gemini-web-flash", []);
+    expect(resolved).toEqual({ mode: 1, think: 4, hashId: null, displayName: "gemini-web-flash" });
+  });
 });
 
 describe("fetchGeminiModelList / getGeminiModelList", () => {
