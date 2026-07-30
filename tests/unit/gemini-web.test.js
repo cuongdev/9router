@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   parseGeminiAuthHtml,
   scrapeGeminiAuth,
@@ -15,8 +15,6 @@ import {
   extractGeminiText,
   GeminiWebExecutor,
 } from "../../open-sse/executors/gemini-web.js";
-
-const originalFetch = global.fetch;
 
 const SAMPLE_HTML_LOGGED_IN = `<script>window.WIZ_global_data = {"SNlM0e":"AXYZtokenvalue123","cfb2h":"boq_assistant-bard-web-server_20260728.05_p0","FdrFJe":"-1513666763805209402"};</script>`;
 

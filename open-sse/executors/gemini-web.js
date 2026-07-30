@@ -300,20 +300,20 @@ export class GeminiWebExecutor extends BaseExecutor {
       try {
         freshAuth = await scrapeGeminiAuth(cookie, fetchImpl);
       } catch (err) {
-        return { response: authInvalidError(), url: attempt.url, headers: attempt.headers, transformedBody: attempt.bodyStr };
+        return { response: authInvalidError(), url: attempt.url, headers: {}, transformedBody: attempt.bodyStr };
       }
       authCache.set(connectionId, { value: freshAuth, expiresAt: Date.now() + AUTH_CACHE_TTL_MS });
       if (freshAuth.redirectedToLogin) {
-        return { response: authInvalidError(), url: attempt.url, headers: attempt.headers, transformedBody: attempt.bodyStr };
+        return { response: authInvalidError(), url: attempt.url, headers: {}, transformedBody: attempt.bodyStr };
       }
       try {
         attempt = await sendOnce(freshAuth);
       } catch (err) {
         log?.error?.("GEMINI-WEB", `Retry fetch failed: ${err.message || String(err)}`);
-        return { response: jsonError(502, `Gemini connection failed: ${err.message || String(err)}`), url: attempt.url, headers: attempt.headers, transformedBody: attempt.bodyStr };
+        return { response: jsonError(502, `Gemini connection failed: ${err.message || String(err)}`), url: attempt.url, headers: {}, transformedBody: attempt.bodyStr };
       }
       if (!attempt.response.ok && (attempt.response.status === 401 || attempt.response.status === 403)) {
-        return { response: authInvalidError(), url: attempt.url, headers: attempt.headers, transformedBody: attempt.bodyStr };
+        return { response: authInvalidError(), url: attempt.url, headers: {}, transformedBody: attempt.bodyStr };
       }
     }
 
@@ -324,7 +324,7 @@ export class GeminiWebExecutor extends BaseExecutor {
       let errMsg = `Gemini returned HTTP ${status}`;
       if (status === 429) errMsg = "Gemini rate limited. Wait a moment and retry.";
       log?.warn?.("GEMINI-WEB", errMsg);
-      return { response: jsonError(status, errMsg, `HTTP_${status}`), url, headers, transformedBody: bodyStr };
+      return { response: jsonError(status, errMsg, `HTTP_${status}`), url, headers: {}, transformedBody: bodyStr };
     }
 
     const rawText = await response.text();
@@ -333,10 +333,10 @@ export class GeminiWebExecutor extends BaseExecutor {
       text = extractGeminiText(rawText);
     } catch (err) {
       log?.warn?.("GEMINI-WEB", `Upstream error: ${err.message}`);
-      return { response: jsonError(502, err.message, "GEMINI_UPSTREAM_ERROR"), url, headers, transformedBody: bodyStr };
+      return { response: jsonError(502, err.message, "GEMINI_UPSTREAM_ERROR"), url, headers: {}, transformedBody: bodyStr };
     }
     if (!text) {
-      return { response: jsonError(502, "Gemini returned an empty response"), url, headers, transformedBody: bodyStr };
+      return { response: jsonError(502, "Gemini returned an empty response"), url, headers: {}, transformedBody: bodyStr };
     }
 
     const cid = `chatcmpl-gemini-web-${crypto.randomUUID().slice(0, 12)}`;
@@ -346,7 +346,7 @@ export class GeminiWebExecutor extends BaseExecutor {
       ? new Response(buildGeminiStreamingResponse(text, model, cid, created), { status: 200, headers: { ...SSE_HEADERS_NO_BUFFER } })
       : buildGeminiNonStreamingResponse(text, model, cid, created);
 
-    return { response: finalResponse, url, headers, transformedBody: bodyStr };
+    return { response: finalResponse, url, headers: {}, transformedBody: bodyStr };
   }
 }
 
