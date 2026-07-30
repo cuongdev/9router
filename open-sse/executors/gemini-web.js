@@ -177,3 +177,177 @@ export function extractGeminiText(rawText) {
   for (let i = texts.length - 1; i >= 0; i--) if (texts[i].trim()) return texts[i];
   return "";
 }
+
+import { PROVIDERS } from "../config/providers.js";
+import { SSE_DONE, SSE_HEADERS_NO_BUFFER } from "../utils/sseConstants.js";
+import { sseChunk } from "../utils/sse.js";
+import { flattenChatMessages } from "../utils/flattenChatMessages.js";
+
+const GEMINI_STREAM_GENERATE_URL =
+  "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
+
+function buildStreamGenerateUrl(bl, reqId) {
+  const params = new URLSearchParams({ bl, hl: "en", _reqid: String(reqId), rt: "c" });
+  return `${GEMINI_STREAM_GENERATE_URL}?${params.toString()}`;
+}
+
+function jsonError(status, message, code) {
+  return new Response(JSON.stringify({ error: { message, type: "upstream_error", ...(code ? { code } : {}) } }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function buildGeminiStreamingResponse(text, model, cid, created) {
+  const encoder = new TextEncoder();
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(sseChunk({
+        id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
+        choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null, logprobs: null }],
+      })));
+      const words = text.length > 0 ? text.split(/(?<=\s)/) : [];
+      for (const word of words) {
+        controller.enqueue(encoder.encode(sseChunk({
+          id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
+          choices: [{ index: 0, delta: { content: word }, finish_reason: null, logprobs: null }],
+        })));
+      }
+      controller.enqueue(encoder.encode(sseChunk({
+        id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
+        choices: [{ index: 0, delta: {}, finish_reason: "stop", logprobs: null }],
+      })));
+      controller.enqueue(encoder.encode(SSE_DONE));
+      controller.close();
+    },
+  });
+}
+
+function buildGeminiNonStreamingResponse(text, model, cid, created) {
+  const promptTokens = Math.ceil(text.length / 4);
+  return new Response(JSON.stringify({
+    id: cid, object: "chat.completion", created, model, system_fingerprint: null,
+    choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop", logprobs: null }],
+    usage: { prompt_tokens: promptTokens, completion_tokens: promptTokens, total_tokens: promptTokens * 2 },
+  }), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
+export class GeminiWebExecutor extends BaseExecutor {
+  constructor() {
+    super("gemini-web", PROVIDERS["gemini-web"]);
+  }
+
+  async execute({ model, body, stream, credentials, signal, log, fetchImpl = fetch }) {
+    const messages = body?.messages;
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return { response: jsonError(400, "Missing or empty messages array"), url: GEMINI_STREAM_GENERATE_URL, headers: {}, transformedBody: body };
+    }
+
+    const cookie = credentials?.apiKey || "";
+    const connectionId = credentials?.connectionId || cookie;
+    const authInvalidError = () => jsonError(401, "Gemini cookie hết hạn hoặc không hợp lệ, vui lòng dán lại document.cookie.", "GEMINI_COOKIE_INVALID");
+
+    let auth;
+    try {
+      auth = await getGeminiAuth(connectionId, cookie, fetchImpl);
+    } catch (err) {
+      log?.error?.("GEMINI-WEB", `Auth bootstrap failed: ${err.message || String(err)}`);
+      return { response: jsonError(502, `Gemini bootstrap failed: ${err.message || String(err)}`), url: GEMINI_STREAM_GENERATE_URL, headers: {}, transformedBody: body };
+    }
+
+    if (auth.redirectedToLogin) {
+      log?.warn?.("GEMINI-WEB", "Bootstrap GET redirected to accounts.google.com — cookie invalid/expired");
+      return { response: authInvalidError(), url: GEMINI_STREAM_GENERATE_URL, headers: {}, transformedBody: body };
+    }
+    if (!auth.at) {
+      // Known Google-side flakiness: SNlM0e sometimes absent from page HTML without a
+      // login redirect. Proceed with an empty token — only escalate if the chat call itself 401s.
+      log?.warn?.("GEMINI-WEB", "SNlM0e token not found in page HTML; proceeding without it");
+    }
+
+    const modelList = await getGeminiModelList(connectionId, auth, fetchImpl);
+    const resolved = resolveGeminiModel(model, modelList);
+    const prompt = flattenChatMessages(messages);
+
+    const sendOnce = async (authToUse) => {
+      const reqId = Math.floor(Math.random() * 900000) + 100000;
+      const url = buildStreamGenerateUrl(authToUse.bl, reqId);
+      const bodyStr = new URLSearchParams({
+        "f.req": buildGeminiFreq(prompt, resolved.mode, resolved.think),
+        at: authToUse.at || "",
+      }).toString();
+      const headers = { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8", "X-Same-Domain": "1", Cookie: cookie };
+      const fetchOpts = { method: "POST", headers, body: bodyStr };
+      if (signal) fetchOpts.signal = signal;
+      const response = await fetchImpl(url, fetchOpts);
+      return { response, url, headers, bodyStr };
+    };
+
+    log?.info?.("GEMINI-WEB", `Query to ${model} (resolved=${resolved.displayName}, mode=${resolved.mode}), len=${prompt.length}`);
+
+    let attempt;
+    try {
+      attempt = await sendOnce(auth);
+    } catch (err) {
+      log?.error?.("GEMINI-WEB", `Fetch failed: ${err.message || String(err)}`);
+      return { response: jsonError(502, `Gemini connection failed: ${err.message || String(err)}`), url: GEMINI_STREAM_GENERATE_URL, headers: {}, transformedBody: body };
+    }
+
+    if (!attempt.response.ok && (attempt.response.status === 401 || attempt.response.status === 403)) {
+      // Chat RPC itself rejected the token — force a fresh bootstrap (bypassing the cache) and retry once.
+      log?.warn?.("GEMINI-WEB", `StreamGenerate returned ${attempt.response.status}; re-bootstrapping auth and retrying once`);
+      let freshAuth;
+      try {
+        freshAuth = await scrapeGeminiAuth(cookie, fetchImpl);
+      } catch (err) {
+        return { response: authInvalidError(), url: attempt.url, headers: attempt.headers, transformedBody: attempt.bodyStr };
+      }
+      authCache.set(connectionId, { value: freshAuth, expiresAt: Date.now() + AUTH_CACHE_TTL_MS });
+      if (freshAuth.redirectedToLogin) {
+        return { response: authInvalidError(), url: attempt.url, headers: attempt.headers, transformedBody: attempt.bodyStr };
+      }
+      try {
+        attempt = await sendOnce(freshAuth);
+      } catch (err) {
+        log?.error?.("GEMINI-WEB", `Retry fetch failed: ${err.message || String(err)}`);
+        return { response: jsonError(502, `Gemini connection failed: ${err.message || String(err)}`), url: attempt.url, headers: attempt.headers, transformedBody: attempt.bodyStr };
+      }
+      if (!attempt.response.ok && (attempt.response.status === 401 || attempt.response.status === 403)) {
+        return { response: authInvalidError(), url: attempt.url, headers: attempt.headers, transformedBody: attempt.bodyStr };
+      }
+    }
+
+    const { response, url, headers, bodyStr } = attempt;
+
+    if (!response.ok) {
+      const status = response.status;
+      let errMsg = `Gemini returned HTTP ${status}`;
+      if (status === 429) errMsg = "Gemini rate limited. Wait a moment and retry.";
+      log?.warn?.("GEMINI-WEB", errMsg);
+      return { response: jsonError(status, errMsg, `HTTP_${status}`), url, headers, transformedBody: bodyStr };
+    }
+
+    const rawText = await response.text();
+    let text;
+    try {
+      text = extractGeminiText(rawText);
+    } catch (err) {
+      log?.warn?.("GEMINI-WEB", `Upstream error: ${err.message}`);
+      return { response: jsonError(502, err.message, "GEMINI_UPSTREAM_ERROR"), url, headers, transformedBody: bodyStr };
+    }
+    if (!text) {
+      return { response: jsonError(502, "Gemini returned an empty response"), url, headers, transformedBody: bodyStr };
+    }
+
+    const cid = `chatcmpl-gemini-web-${crypto.randomUUID().slice(0, 12)}`;
+    const created = Math.floor(Date.now() / 1000);
+
+    const finalResponse = stream
+      ? new Response(buildGeminiStreamingResponse(text, model, cid, created), { status: 200, headers: { ...SSE_HEADERS_NO_BUFFER } })
+      : buildGeminiNonStreamingResponse(text, model, cid, created);
+
+    return { response: finalResponse, url, headers, transformedBody: bodyStr };
+  }
+}
+
+export default GeminiWebExecutor;

@@ -13,6 +13,7 @@ import {
   GEMINI_MODEL_SHORT_NAMES,
   buildGeminiFreq,
   extractGeminiText,
+  GeminiWebExecutor,
 } from "../../open-sse/executors/gemini-web.js";
 
 const originalFetch = global.fetch;
@@ -228,5 +229,203 @@ describe("extractGeminiText", () => {
 
   it("returns an empty string when no frame contains text", () => {
     expect(extractGeminiText('[["di",270]]\n')).toBe("");
+  });
+});
+
+function mockGeminiHtml() {
+  return SAMPLE_HTML_LOGGED_IN;
+}
+
+function mockStreamGenerateBody(text) {
+  const frame = ["wrb.fr", null, JSON.stringify([null, null, null, null, [[null, [text]]]])];
+  return JSON.stringify([frame]) + "\n";
+}
+
+describe("GeminiWebExecutor.execute", () => {
+  beforeEach(() => {
+    clearGeminiAuthCache();
+    clearGeminiModelCache();
+  });
+
+  function makeFetch({ streamGenerateText = "Hello from Gemini" } = {}) {
+    const calls = [];
+    const fetchImpl = vi.fn(async (url, opts) => {
+      calls.push({ url, opts });
+      if (url.includes("gemini.google.com/app")) {
+        return { url: "https://gemini.google.com/app", text: async () => mockGeminiHtml() };
+      }
+      if (url.includes("otAQ7b")) {
+        return { text: async () => SAMPLE_MODEL_LIST_FRAME };
+      }
+      if (url.includes("StreamGenerate")) {
+        return { ok: true, status: 200, text: async () => mockStreamGenerateBody(streamGenerateText) };
+      }
+      throw new Error(`unexpected fetch url: ${url}`);
+    });
+    return { fetchImpl, calls };
+  }
+
+  it("returns a non-streaming chat.completion response with the extracted text", async () => {
+    const { fetchImpl } = makeFetch();
+    const exec = new GeminiWebExecutor();
+    const { response } = await exec.execute({
+      model: "gemini-web-flash",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials: { apiKey: "cookie-fixture-abc", connectionId: "conn-1" },
+      fetchImpl,
+    });
+    const json = await response.json();
+    expect(response.status).toBe(200);
+    expect(json.object).toBe("chat.completion");
+    expect(json.choices[0].message.content).toBe("Hello from Gemini");
+  });
+
+  it("returns a simulated SSE stream with the extracted text chunked, for stream: true", async () => {
+    const { fetchImpl } = makeFetch({ streamGenerateText: "Hi there friend" });
+    const exec = new GeminiWebExecutor();
+    const { response } = await exec.execute({
+      model: "gemini-web-flash",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: true,
+      credentials: { apiKey: "cookie-fixture-abc", connectionId: "conn-1" },
+      fetchImpl,
+    });
+    const text = await response.text();
+    expect(text).toContain("data: ");
+    expect(text).toContain("[DONE]");
+    expect(text.includes("Hi") && text.includes("there") && text.includes("friend")).toBe(true);
+  });
+
+  it("only bootstraps auth/models once across two chat calls on the same connection", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const exec = new GeminiWebExecutor();
+    const req = {
+      model: "gemini-web-flash",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials: { apiKey: "cookie-fixture-abc", connectionId: "conn-1" },
+      fetchImpl,
+    };
+    await exec.execute(req);
+    await exec.execute(req);
+    const bootstrapCalls = calls.filter((c) => c.url.includes("/app") || c.url.includes("otAQ7b"));
+    expect(bootstrapCalls).toHaveLength(2); // one /app GET + one otAQ7b POST, only on the first call
+  });
+
+  it("returns 400 when messages is missing or empty", async () => {
+    const exec = new GeminiWebExecutor();
+    const { response } = await exec.execute({
+      model: "gemini-web-flash",
+      body: {},
+      stream: false,
+      credentials: { apiKey: "cookie-fixture-abc", connectionId: "conn-1" },
+    });
+    expect(response.status).toBe(400);
+  });
+
+  it("returns 401 with a re-paste-cookie message when the bootstrap scrape is not logged in", async () => {
+    const fetchImpl = vi.fn(async (url) => {
+      if (url.includes("/app")) return { url: "https://accounts.google.com/signin", text: async () => "<html>login</html>" };
+      throw new Error(`unexpected fetch url: ${url}`);
+    });
+    const exec = new GeminiWebExecutor();
+    const { response } = await exec.execute({
+      model: "gemini-web-flash",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials: { apiKey: "expired-cookie", connectionId: "conn-2" },
+      fetchImpl,
+    });
+    expect(response.status).toBe(401);
+    const json = await response.json();
+    expect(json.error.message).toMatch(/cookie|dán lại/i);
+  });
+
+  it("maps a BardErrorInfo body to a 502 upstream error", async () => {
+    const fetchImpl = vi.fn(async (url) => {
+      if (url.includes("/app")) return { url: "https://gemini.google.com/app", text: async () => mockGeminiHtml() };
+      if (url.includes("otAQ7b")) return { text: async () => SAMPLE_MODEL_LIST_FRAME };
+      if (url.includes("StreamGenerate")) return { ok: true, status: 200, text: async () => "BardErrorInfo [32]" };
+      throw new Error(`unexpected fetch url: ${url}`);
+    });
+    const exec = new GeminiWebExecutor();
+    const { response } = await exec.execute({
+      model: "gemini-web-flash",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials: { apiKey: "cookie-fixture-abc", connectionId: "conn-3" },
+      fetchImpl,
+    });
+    expect(response.status).toBe(502);
+  });
+
+  it("maps HTTP 429 from StreamGenerate to a 429 response", async () => {
+    const fetchImpl = vi.fn(async (url) => {
+      if (url.includes("/app")) return { url: "https://gemini.google.com/app", text: async () => mockGeminiHtml() };
+      if (url.includes("otAQ7b")) return { text: async () => SAMPLE_MODEL_LIST_FRAME };
+      if (url.includes("StreamGenerate")) return { ok: false, status: 429, text: async () => "" };
+      throw new Error(`unexpected fetch url: ${url}`);
+    });
+    const exec = new GeminiWebExecutor();
+    const { response } = await exec.execute({
+      model: "gemini-web-flash",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials: { apiKey: "cookie-fixture-abc", connectionId: "conn-4" },
+      fetchImpl,
+    });
+    expect(response.status).toBe(429);
+  });
+
+  it("retries once with a fresh bootstrap when StreamGenerate 401s, and succeeds on the second attempt", async () => {
+    let streamGenerateCalls = 0;
+    let appScrapeCalls = 0;
+    const fetchImpl = vi.fn(async (url) => {
+      if (url.includes("/app")) {
+        appScrapeCalls++;
+        return { url: "https://gemini.google.com/app", text: async () => mockGeminiHtml() };
+      }
+      if (url.includes("otAQ7b")) return { text: async () => SAMPLE_MODEL_LIST_FRAME };
+      if (url.includes("StreamGenerate")) {
+        streamGenerateCalls++;
+        if (streamGenerateCalls === 1) return { ok: false, status: 401, text: async () => "" };
+        return { ok: true, status: 200, text: async () => mockStreamGenerateBody("recovered answer") };
+      }
+      throw new Error(`unexpected fetch url: ${url}`);
+    });
+    const exec = new GeminiWebExecutor();
+    const { response } = await exec.execute({
+      model: "gemini-web-flash",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials: { apiKey: "cookie-fixture-abc", connectionId: "conn-5" },
+      fetchImpl,
+    });
+    expect(response.status).toBe(200);
+    const json = await response.json();
+    expect(json.choices[0].message.content).toBe("recovered answer");
+    expect(streamGenerateCalls).toBe(2);
+    expect(appScrapeCalls).toBe(2); // initial bootstrap + forced re-bootstrap after the 401
+  });
+
+  it("returns 401 cookie-invalid if StreamGenerate still 401s after the retry", async () => {
+    const fetchImpl = vi.fn(async (url) => {
+      if (url.includes("/app")) return { url: "https://gemini.google.com/app", text: async () => mockGeminiHtml() };
+      if (url.includes("otAQ7b")) return { text: async () => SAMPLE_MODEL_LIST_FRAME };
+      if (url.includes("StreamGenerate")) return { ok: false, status: 401, text: async () => "" };
+      throw new Error(`unexpected fetch url: ${url}`);
+    });
+    const exec = new GeminiWebExecutor();
+    const { response } = await exec.execute({
+      model: "gemini-web-flash",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials: { apiKey: "cookie-fixture-abc", connectionId: "conn-6" },
+      fetchImpl,
+    });
+    expect(response.status).toBe(401);
+    const json = await response.json();
+    expect(json.error.message).toMatch(/cookie|dán lại/i);
   });
 });
