@@ -11,6 +11,8 @@ import {
   clearGeminiModelCache,
   resolveGeminiModel,
   GEMINI_MODEL_SHORT_NAMES,
+  buildGeminiFreq,
+  extractGeminiText,
 } from "../../open-sse/executors/gemini-web.js";
 
 const originalFetch = global.fetch;
@@ -190,5 +192,41 @@ describe("fetchGeminiModelList / getGeminiModelList", () => {
     await getGeminiModelList("conn-1", { at: "t", bl: "b", sid: "s" }, fetchImpl);
     await getGeminiModelList("conn-1", { at: "t", bl: "b", sid: "s" }, fetchImpl);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("buildGeminiFreq", () => {
+  it("embeds the prompt, mode and think flag in the freeze-encoded payload", () => {
+    const freq = buildGeminiFreq("hello world", 3, 4);
+    const [, innerStr] = JSON.parse(freq);
+    const inner = JSON.parse(innerStr);
+    expect(inner[0][0]).toBe("hello world");
+    expect(inner[79]).toBe(3);
+    expect(inner[17]).toEqual([[4]]);
+  });
+
+  it("is valid JSON at both the outer and inner level", () => {
+    const freq = buildGeminiFreq("q", 1, 4);
+    expect(() => JSON.parse(freq)).not.toThrow();
+    const [outerFirst, innerStr] = JSON.parse(freq);
+    expect(outerFirst).toBeNull();
+    expect(() => JSON.parse(innerStr)).not.toThrow();
+  });
+});
+
+describe("extractGeminiText", () => {
+  it("returns the last non-empty cumulative text frame", () => {
+    const frame1 = ["wrb.fr", null, JSON.stringify([null, null, null, null, [[null, ["Hel"]]]])];
+    const frame2 = ["wrb.fr", null, JSON.stringify([null, null, null, null, [[null, ["Hello world"]]]])];
+    const raw = JSON.stringify([frame1]) + "\n" + JSON.stringify([frame2]) + "\n";
+    expect(extractGeminiText(raw)).toBe("Hello world");
+  });
+
+  it("throws when a BardErrorInfo marker is present", () => {
+    expect(() => extractGeminiText("some text BardErrorInfo [32] more text")).toThrow(/BardErrorInfo \[32\]/);
+  });
+
+  it("returns an empty string when no frame contains text", () => {
+    expect(extractGeminiText('[["di",270]]\n')).toBe("");
   });
 });

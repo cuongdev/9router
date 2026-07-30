@@ -128,3 +128,52 @@ export function resolveGeminiModel(modelId, modelList) {
   const chosen = found || modelList.find((m) => m.isDefault) || modelList[0];
   return { mode: chosen.mode, think: DEFAULT_THINK, hashId: chosen.hashId, displayName: chosen.displayName };
 }
+
+export function buildGeminiFreq(prompt, mode, think) {
+  const inner = new Array(80).fill(null);
+  inner[0] = [prompt, 0, null, null, null, null, 0];
+  inner[1] = ["en"];
+  inner[2] = ["", "", "", null, null, null, null, null, null, ""];
+  inner[6] = [0];
+  inner[7] = 1;
+  inner[10] = 1;
+  inner[11] = 0;
+  inner[17] = [[think]];
+  inner[18] = 0;
+  inner[27] = 1;
+  inner[30] = [4];
+  inner[41] = [2];
+  inner[53] = 0;
+  inner[59] = crypto.randomUUID();
+  inner[61] = [];
+  inner[68] = 1;
+  inner[79] = mode;
+  return JSON.stringify([null, JSON.stringify(inner)]);
+}
+
+export function extractGeminiText(rawText) {
+  const bardErr = rawText.match(/BardErrorInfo\s*\[(\d+)\]/);
+  if (bardErr) throw new Error(`BardErrorInfo [${bardErr[1]}]`);
+
+  const texts = [];
+  for (const line of rawText.split("\n")) {
+    if (!line.includes('"wrb.fr"') || line.length < 50) continue;
+    try {
+      const arr = JSON.parse(line);
+      const innerStr = arr?.[0]?.[2];
+      if (!innerStr) continue;
+      const inner = JSON.parse(innerStr);
+      const chunk = inner?.[4];
+      if (!Array.isArray(chunk)) continue;
+      for (const part of chunk) {
+        if (Array.isArray(part) && Array.isArray(part[1])) {
+          for (const t of part[1]) if (typeof t === "string" && t.length > 0) texts.push(t);
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+  for (let i = texts.length - 1; i >= 0; i--) if (texts[i].trim()) return texts[i];
+  return "";
+}
