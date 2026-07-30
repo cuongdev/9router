@@ -548,7 +548,6 @@
     "headers": {
       "Content-Type": "application/json",
       "Accept": "application/vnd.amazon.eventstream",
-      "X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
       "User-Agent": "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
       "X-Amz-User-Agent": "aws-sdk-js/3.0.0 kiro-ide/1.0.0"
     },
@@ -967,8 +966,14 @@
     "validateUrl": "https://api.morphllm.com/v1/models",
     "format": "openai"
   },
-  "devin-cli": {
-    "baseUrl": "devin://acp/stdio",
+  "poolside": {
+    "baseUrl": "https://inference.poolside.ai/v1/chat/completions",
+    "validateUrl": "https://inference.poolside.ai/v1/models",
     "format": "openai"
+  },
+  "gemini-web": {
+    "baseUrl": "https://gemini.google.com/_/BardChatUi/data",
+    "format": "gemini-web",
+    "authType": "cookie"
   }
 }
