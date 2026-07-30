@@ -2,6 +2,7 @@ import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { SSE_DONE, SSE_HEADERS_NO_BUFFER } from "../utils/sseConstants.js";
 import { sseChunk } from "../utils/sse.js";
+import { flattenChatMessages } from "../utils/flattenChatMessages.js";
 
 const GROK_CHAT_API = PROVIDERS["grok-web"].baseUrl;
 const GROK_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -41,34 +42,6 @@ function randomHex(bytes) {
   const arr = new Uint8Array(bytes);
   crypto.getRandomValues(arr);
   return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function parseOpenAIMessages(messages) {
-  const extracted = [];
-  for (const msg of messages) {
-    let role = String(msg.role || "user");
-    if (role === "developer") role = "system";
-    let content = "";
-    if (typeof msg.content === "string") {
-      content = msg.content;
-    } else if (Array.isArray(msg.content)) {
-      content = msg.content.filter((c) => c.type === "text").map((c) => String(c.text || "")).join(" ");
-    }
-    if (!content.trim()) continue;
-    extracted.push({ role, text: content });
-  }
-
-  let lastUserIdx = -1;
-  for (let i = extracted.length - 1; i >= 0; i--) {
-    if (extracted[i].role === "user") { lastUserIdx = i; break; }
-  }
-
-  const parts = [];
-  for (let i = 0; i < extracted.length; i++) {
-    const { role, text } = extracted[i];
-    parts.push(i === lastUserIdx ? text : `${role}: ${text}`);
-  }
-  return parts.join("\n\n");
 }
 
 async function* readGrokNdjsonEvents(body, signal) {
@@ -236,7 +209,7 @@ export class GrokWebExecutor extends BaseExecutor {
     if (!modelInfo) log?.info?.("GROK-WEB", `Unmapped model ${model}, defaulting to grok-4.1-fast`);
     const { grokModel, modelMode, isThinking } = modelInfo || MODEL_MAP["grok-4.1-fast"];
 
-    const message = parseOpenAIMessages(messages);
+    const message = flattenChatMessages(messages);
     if (!message.trim()) {
       const errResp = new Response(JSON.stringify({
         error: { message: "Empty query after processing", type: "invalid_request" },
