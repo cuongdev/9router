@@ -323,7 +323,8 @@ const PROVIDER_MODELS_CONFIG = {
         if (modelList.length) {
           return {
             models: modelList.map((m) => ({
-              id: GEMINI_WEB_ID_BY_SHORT_NAME[m.shortName] || m.shortName,
+              id: GEMINI_WEB_ID_BY_SHORT_NAME[m.shortName]
+                || `gemini-web-${String(m.shortName || m.hashId).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")}`,
               name: m.displayName,
               upstreamModelId: m.hashId,
             })),
