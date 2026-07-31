@@ -301,7 +301,10 @@ describe("GeminiWebExecutor.execute", () => {
     });
     const text = await response.text();
     expect(text).toContain("data: ");
-    expect(text).toContain("[DONE]");
+    // No [DONE] here by design: transport.format:"openai" routes this through chatCore's
+    // passthrough pipeline, which appends its own [DONE] at flush — emitting one from the
+    // executor too produced a duplicate in the full pipeline (verified live).
+    expect(text).not.toContain("[DONE]");
     expect(text.includes("Hi") && text.includes("there") && text.includes("friend")).toBe(true);
   });
 

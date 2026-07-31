@@ -187,7 +187,7 @@ export function extractGeminiText(rawText) {
 }
 
 import { PROVIDERS } from "../config/providers.js";
-import { SSE_DONE, SSE_HEADERS_NO_BUFFER } from "../utils/sseConstants.js";
+import { SSE_HEADERS_NO_BUFFER } from "../utils/sseConstants.js";
 import { sseChunk } from "../utils/sse.js";
 import { flattenChatMessages } from "../utils/flattenChatMessages.js";
 
@@ -225,7 +225,9 @@ function buildGeminiStreamingResponse(text, model, cid, created) {
         id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
         choices: [{ index: 0, delta: {}, finish_reason: "stop", logprobs: null }],
       })));
-      controller.enqueue(encoder.encode(SSE_DONE));
+      // No `[DONE]` here: with transport.format:"openai" this stream goes through
+      // chatCore's passthrough pipeline, which appends its own `[DONE]` at flush —
+      // emitting one here as well produced a duplicate (verified live).
       controller.close();
     },
   });
