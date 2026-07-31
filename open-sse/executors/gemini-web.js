@@ -1,8 +1,15 @@
+import { Agent } from "undici";
 import { BaseExecutor } from "./base.js";
 
 export const GEMINI_FALLBACK_BL = "boq_assistant-bard-web-server_20260728.05_p0";
 const GEMINI_APP_URL = "https://gemini.google.com/app";
 const AUTH_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+// Google's responses here carry many Set-Cookie/tracking headers — especially when the
+// request's own Cookie header is large (a full pasted document.cookie) — and routinely
+// exceed undici/Node's default 8KB header size limit (UND_ERR_HEADERS_OVERFLOW). Use a
+// dedicated dispatcher with a much higher ceiling for every real request this file makes.
+const GEMINI_HTTP_AGENT = new Agent({ headersTimeout: 30000, maxHeaderSize: 131072 });
 
 export function parseGeminiAuthHtml(html, finalUrl) {
   const at = html.match(/"SNlM0e":"([^"]+)"/)?.[1] ?? null;
@@ -13,7 +20,7 @@ export function parseGeminiAuthHtml(html, finalUrl) {
 }
 
 export async function scrapeGeminiAuth(cookie, fetchImpl = fetch) {
-  const res = await fetchImpl(GEMINI_APP_URL, { headers: { Cookie: cookie } });
+  const res = await fetchImpl(GEMINI_APP_URL, { headers: { Cookie: cookie }, dispatcher: GEMINI_HTTP_AGENT });
   const html = await res.text();
   return parseGeminiAuthHtml(html, res.url || GEMINI_APP_URL);
 }
@@ -96,6 +103,7 @@ export async function fetchGeminiModelList(auth, fetchImpl = fetch) {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
     body,
+    dispatcher: GEMINI_HTTP_AGENT,
   });
   const text = await res.text();
   return parseGeminiModelList(text);
@@ -277,7 +285,7 @@ export class GeminiWebExecutor extends BaseExecutor {
         at: authToUse.at || "",
       }).toString();
       const headers = { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8", "X-Same-Domain": "1", Cookie: cookie };
-      const fetchOpts = { method: "POST", headers, body: bodyStr };
+      const fetchOpts = { method: "POST", headers, body: bodyStr, dispatcher: GEMINI_HTTP_AGENT };
       if (signal) fetchOpts.signal = signal;
       const response = await fetchImpl(url, fetchOpts);
       return { response, url, headers, bodyStr };

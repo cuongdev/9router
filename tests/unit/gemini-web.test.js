@@ -70,6 +70,16 @@ describe("scrapeGeminiAuth", () => {
     expect(auth.at).toBe("AXYZtokenvalue123");
     expect(auth.redirectedToLogin).toBe(false);
   });
+
+  it("uses a custom dispatcher with a larger header size limit (Google's response headers routinely exceed undici's 8KB default)", async () => {
+    let capturedOpts;
+    const fetchImpl = vi.fn(async (url, opts) => {
+      capturedOpts = opts;
+      return { url: "https://gemini.google.com/app", text: async () => SAMPLE_HTML_LOGGED_IN };
+    });
+    await scrapeGeminiAuth("cookie-fixture-abc", fetchImpl);
+    expect(capturedOpts.dispatcher).toBeDefined();
+  });
 });
 
 describe("getGeminiAuth (cache)", () => {
