@@ -457,11 +457,12 @@ export default function ProviderDetailPage() {
     fetchDisabledModels();
   }, [fetchConnections, fetchAliases, fetchCustomModels, fetchDisabledModels]);
 
-  // Cursor's model availability is account-specific and changes frequently.
-  // Load the active account's live catalog for the dashboard; the static
-  // registry remains the fallback while the request is pending or unavailable.
+  // Cursor's and gemini-web's model availability is account-specific and
+  // changes frequently. Load the active account's live catalog for the
+  // dashboard; the static registry remains the fallback while the request
+  // is pending or unavailable.
   useEffect(() => {
-    if (providerId !== "cursor") {
+    if (providerId !== "cursor" && providerId !== "gemini-web") {
       setLiveModels([]);
       return;
     }
