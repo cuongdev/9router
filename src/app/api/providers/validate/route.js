@@ -5,6 +5,7 @@ import { getDefaultModel } from "open-sse/config/providerModels.js";
 import { resolveOllamaLocalHost, resolveXiaomiTokenplanBaseUrl, PROVIDERS } from "open-sse/config/providers.js";
 import { openaiToCommandCodeRequest } from "open-sse/translator/request/openai-to-commandcode.js";
 import { normalizeProviderId } from "@/lib/providerNormalization";
+import { scrapeGeminiAuth } from "open-sse/executors/gemini-web.js";
 
 // Probe a webSearch/webFetch provider using its searchConfig/fetchConfig.
 // Returns true if API key is accepted (status !== 401 && !== 403).
@@ -575,6 +576,17 @@ export async function POST(request) {
           if (res.status === 401 || res.status === 403) {
             isValid = false;
             error = "Invalid session cookie — re-paste __Secure-next-auth.session-token from perplexity.ai";
+          } else {
+            isValid = true;
+          }
+          break;
+        }
+
+        case "gemini-web": {
+          const auth = await scrapeGeminiAuth(apiKey);
+          if (auth.redirectedToLogin) {
+            isValid = false;
+            error = "Invalid cookie — redirected to Google login. Re-paste document.cookie from gemini.google.com.";
           } else {
             isValid = true;
           }
