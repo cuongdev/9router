@@ -4,6 +4,7 @@ import { testProxyUrl } from "@/lib/network/proxyTest";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
 import { getDefaultModel } from "open-sse/config/providerModels.js";
 import { resolveOllamaLocalHost, PROVIDERS } from "open-sse/config/providers.js";
+import { scrapeGeminiAuth } from "open-sse/executors/gemini-web.js";
 import {
   refreshProviderCredentials,
   shouldRefreshCredentials,
@@ -760,6 +761,12 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
         const data = await res.json().catch(() => null);
         const valid = !!(data && data.user);
         return { valid, error: valid ? null : "Session expired — re-paste cookie" };
+      }
+      case "gemini-web": {
+        const wrappedFetch = (url, opts) => fetchWithConnectionProxy(url, opts, effectiveProxy);
+        const auth = await scrapeGeminiAuth(connection.apiKey, wrappedFetch);
+        const valid = !auth.redirectedToLogin;
+        return { valid, error: valid ? null : "Cookie invalid or expired — re-paste document.cookie from gemini.google.com" };
       }
       case "opencode-go": {
         const res = await fetchWithConnectionProxy("https://opencode.ai/zen/go/v1/chat/completions", {
