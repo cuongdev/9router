@@ -11,6 +11,11 @@ import { resolveQoderModels } from "open-sse/services/qoderModels.js";
 import { resolveGrokCliModels } from "open-sse/services/grokCliModels.js";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { resolveCursorModels } from "open-sse/services/cursorModels.js";
+import { getGeminiAuth, getGeminiModelList, GEMINI_MODEL_SHORT_NAMES } from "open-sse/executors/gemini-web.js";
+
+const GEMINI_WEB_ID_BY_SHORT_NAME = Object.fromEntries(
+  Object.entries(GEMINI_MODEL_SHORT_NAMES).map(([id, shortName]) => [shortName, id])
+);
 
 const GEMINI_CLI_MODELS_URL = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
 
@@ -304,6 +309,33 @@ const PROVIDER_MODELS_CONFIG = {
         models: getStaticProviderModels("cursor"),
         warning: "Cursor returned no live models; falling back to static catalog.",
       };
+    },
+  },
+
+  "gemini-web": {
+    customResolver: async (connection) => {
+      try {
+        const auth = await getGeminiAuth(connection.id, connection.apiKey);
+        if (auth.redirectedToLogin) {
+          return { error: "Cookie invalid or expired — re-paste document.cookie from gemini.google.com", status: 401 };
+        }
+        const modelList = await getGeminiModelList(connection.id, auth);
+        if (modelList.length) {
+          return {
+            models: modelList.map((m) => ({
+              id: GEMINI_WEB_ID_BY_SHORT_NAME[m.shortName] || m.shortName,
+              name: m.displayName,
+              upstreamModelId: m.hashId,
+            })),
+          };
+        }
+        return {
+          models: getStaticProviderModels("gemini-web"),
+          warning: "Gemini Web returned no live models; falling back to static catalog.",
+        };
+      } catch (error) {
+        return { error: error.message || "Failed to fetch Gemini Web models", status: 502 };
+      }
     },
   },
 
