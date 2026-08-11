@@ -30,6 +30,7 @@ export async function handleTts(request) {
   const modelStr = body.model;
   const responseFormat = url.searchParams.get("response_format") || "mp3"; // mp3 (default) | json
   const language = body.language || ""; // Optional language hint (currently used by Gemini)
+  const style = body.style || ""; // Optional style/voice instructions (e.g. Xiaomi MiMo)
   log.request("POST", `${url.pathname} | ${modelStr} | format=${responseFormat}${language ? ` | lang=${language}` : ""}`);
 
   const settings = await getSettings();
@@ -58,7 +59,7 @@ export async function handleTts(request) {
     return handleComboChat({
       body,
       models: allowedComboModels,
-      handleSingleModel: (b, m) => handleSingleModelTts(b, m, responseFormat, language, { ...apiKeyContext, accessPolicy: comboAccessPolicy }),
+      handleSingleModel: (b, m) => handleSingleModelTts(b, m, responseFormat, language, style, { ...apiKeyContext, accessPolicy: comboAccessPolicy }),
       log,
       comboName: modelStr,
       comboStrategy,
@@ -66,7 +67,7 @@ export async function handleTts(request) {
     });
   }
 
-  return handleSingleModelTts(body, modelStr, responseFormat, language, apiKeyContext);
+  return handleSingleModelTts(body, modelStr, responseFormat, language, style, apiKeyContext);
 }
 
 async function authorizeComboAccess(accessPolicy, comboName, comboModels) {
@@ -84,7 +85,7 @@ async function authorizeComboAccess(accessPolicy, comboName, comboModels) {
   return { response: null, models: allowedModels };
 }
 
-async function handleSingleModelTts(body, modelStr, responseFormat, language, apiKeyContext) {
+async function handleSingleModelTts(body, modelStr, responseFormat, language, style, apiKeyContext) {
   const modelInfo = await getModelInfo(modelStr);
   if (!modelInfo.provider) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
 
@@ -96,7 +97,7 @@ async function handleSingleModelTts(body, modelStr, responseFormat, language, ap
     if (!isUnrestricted(apiKeyContext?.accessPolicy)) {
       return accessDeniedResponse(new ApiKeyAccessDeniedError(`API key is not authorized for provider: ${provider}`));
     }
-    const result = await handleTtsCore({ provider, model, input: body.input, responseFormat, language });
+    const result = await handleTtsCore({ provider, model, input: body.input, responseFormat, language, style });
     if (result.success) return result.response;
     return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "TTS failed");
   }
@@ -127,7 +128,7 @@ async function handleSingleModelTts(body, modelStr, responseFormat, language, ap
 
     log.info("AUTH", `\x1b[32mUsing ${provider} account: ${credentials.connectionName}\x1b[0m`);
 
-    const result = await handleTtsCore({ provider, model, input: body.input, credentials, responseFormat, language });
+    const result = await handleTtsCore({ provider, model, input: body.input, credentials, responseFormat, language, style });
 
     if (result.success) return result.response;
 
