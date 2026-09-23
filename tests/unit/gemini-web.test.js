@@ -3,6 +3,7 @@ import {
   parseGeminiAuthHtml,
   scrapeGeminiAuth,
   getGeminiAuth,
+  rotateGeminiPsidts,
   clearGeminiAuthCache,
   GEMINI_FALLBACK_BL,
   parseGeminiModelList,
@@ -98,7 +99,8 @@ describe("getGeminiAuth (cache)", () => {
     }));
     const first = await getGeminiAuth("conn-1", "cookie-fixture-abc", fetchImpl);
     const second = await getGeminiAuth("conn-1", "cookie-fixture-abc", fetchImpl);
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    // One bootstrap = a RotateCookies call + the /app GET; the second call is served from cache.
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
     expect(second).toEqual(first);
   });
 
@@ -109,7 +111,43 @@ describe("getGeminiAuth (cache)", () => {
     }));
     await getGeminiAuth("conn-a", "cookie-a", fetchImpl);
     await getGeminiAuth("conn-b", "cookie-b", fetchImpl);
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    // Two bootstraps, each a RotateCookies call + an /app GET.
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe("rotateGeminiPsidts", () => {
+  it("merges the fresh __Secure-1PSIDTS/SIDCC from the RotateCookies Set-Cookie response", async () => {
+    const fetchImpl = vi.fn(async (url, opts) => {
+      expect(url).toContain("accounts.google.com/RotateCookies");
+      expect(opts.body).toBe('[000,"-0000000000000000000"]');
+      return { ok: true, headers: { getSetCookie: () => ["__Secure-1PSIDTS=sidts-NEW; Path=/; Secure", "SIDCC=cc-NEW; Path=/"] } };
+    });
+    const out = await rotateGeminiPsidts("__Secure-1PSID=durable; __Secure-1PSIDTS=sidts-OLD; SIDCC=cc-OLD", fetchImpl);
+    expect(out).toContain("__Secure-1PSIDTS=sidts-NEW");
+    expect(out).toContain("SIDCC=cc-NEW");
+    expect(out).toContain("__Secure-1PSID=durable");
+    expect(out).not.toContain("sidts-OLD");
+  });
+
+  it("appends a rotated cookie that was not already present", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, headers: { getSetCookie: () => ["__Secure-1PSIDTS=sidts-NEW; Secure"] } }));
+    expect(await rotateGeminiPsidts("__Secure-1PSID=durable", fetchImpl)).toBe("__Secure-1PSID=durable; __Secure-1PSIDTS=sidts-NEW");
+  });
+
+  it("ignores non-rotating Set-Cookie entries (e.g. NID)", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, headers: { getSetCookie: () => ["NID=nope; Secure"] } }));
+    expect(await rotateGeminiPsidts("__Secure-1PSID=x", fetchImpl)).toBe("__Secure-1PSID=x");
+  });
+
+  it("returns the cookie unchanged on a non-ok response (fail-open)", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: false, status: 401 }));
+    expect(await rotateGeminiPsidts("__Secure-1PSID=x", fetchImpl)).toBe("__Secure-1PSID=x");
+  });
+
+  it("returns the cookie unchanged when the request throws (fail-open)", async () => {
+    const fetchImpl = vi.fn(async () => { throw new Error("net"); });
+    expect(await rotateGeminiPsidts("__Secure-1PSID=x", fetchImpl)).toBe("__Secure-1PSID=x");
   });
 });
 
@@ -440,6 +478,9 @@ describe("GeminiWebExecutor.execute", () => {
     const calls = [];
     const fetchImpl = vi.fn(async (url, opts) => {
       calls.push({ url, opts });
+      if (url.includes("RotateCookies")) {
+        return { ok: true, headers: { getSetCookie: () => [] } };
+      }
       if (url.includes("gemini.google.com/app")) {
         return { url: "https://gemini.google.com/app", text: async () => mockGeminiHtml() };
       }
@@ -730,5 +771,29 @@ describe("GeminiWebExecutor.execute", () => {
     expect(content).toContain("Here is your song");
     expect(content).toContain(`[music.mp3](data:audio/mpeg;base64,${Buffer.from("MP3").toString("base64")})`);
     expect(mediaCookie).toBe("cookie-fixture-abc");
+  });
+
+  it("persists the rotated cookie via onCredentialsRefreshed and uses it for StreamGenerate", async () => {
+    let streamCookie;
+    const fetchImpl = vi.fn(async (url, opts) => {
+      if (url.includes("RotateCookies")) return { ok: true, headers: { getSetCookie: () => ["__Secure-1PSIDTS=sidts-FRESH; Secure"] } };
+      if (url.includes("/app")) return { url: "https://gemini.google.com/app", text: async () => mockGeminiHtml() };
+      if (url.includes("otAQ7b")) return { text: async () => SAMPLE_MODEL_LIST_FRAME };
+      if (url.includes("StreamGenerate")) { streamCookie = opts.headers.Cookie; return { ok: true, status: 200, text: async () => mockStreamGenerateBody("hi") }; }
+      throw new Error(`unexpected fetch url: ${url}`);
+    });
+    const persisted = [];
+    const exec = new GeminiWebExecutor();
+    await exec.execute({
+      model: "gemini-web-flash",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials: { apiKey: "__Secure-1PSID=durable", connectionId: "conn-persist", onCredentialsRefreshed: async (c) => persisted.push(c) },
+      fetchImpl,
+    });
+    // The freshly-rotated cookie is what gets sent upstream and persisted.
+    expect(streamCookie).toContain("__Secure-1PSIDTS=sidts-FRESH");
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].apiKey).toBe("__Secure-1PSID=durable; __Secure-1PSIDTS=sidts-FRESH");
   });
 });

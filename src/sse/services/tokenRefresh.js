@@ -193,6 +193,8 @@ export async function updateProviderCredentials(connectionId, newCredentials) {
       };
     }
     if (newCredentials.projectId)            updates.projectId = newCredentials.projectId;
+    // Cookie-auth providers (e.g. gemini-web) refresh their cookie (stored in apiKey) in place.
+    if (newCredentials.apiKey)               updates.apiKey = newCredentials.apiKey;
 
     const result = await updateProviderConnection(connectionId, updates);
     log.info("TOKEN_REFRESH", "Credentials updated in localDb", {

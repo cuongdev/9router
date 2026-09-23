@@ -3,13 +3,52 @@ import { BaseExecutor } from "./base.js";
 
 export const GEMINI_FALLBACK_BL = "boq_assistant-bard-web-server_20260728.05_p0";
 const GEMINI_APP_URL = "https://gemini.google.com/app";
-const AUTH_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+// Auth (and the rotated cookie) is re-derived on this cadence so __Secure-1PSIDTS gets
+// refreshed via RotateCookies well before it expires. Short enough to keep the session
+// alive, long enough to stay clear of RotateCookies rate limits.
+const AUTH_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 // Google's responses here carry many Set-Cookie/tracking headers — especially when the
 // request's own Cookie header is large (a full pasted document.cookie) — and routinely
 // exceed undici/Node's default 8KB header size limit (UND_ERR_HEADERS_OVERFLOW). Use a
 // dedicated dispatcher with a much higher ceiling for every real request this file makes.
 const GEMINI_HTTP_AGENT = new Agent({ headersTimeout: 30000, maxHeaderSize: 131072 });
+
+const GEMINI_IMAGE_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
+const GEMINI_ROTATE_URL = "https://accounts.google.com/RotateCookies";
+// Volatile session cookies RotateCookies refreshes; the durable __Secure-1PSID is untouched.
+const GEMINI_ROTATING_COOKIE_RE = /^(__Secure-[13]PSIDTS|SIDCC|__Secure-[13]PSIDCC)$/;
+
+// Google rotates __Secure-1PSIDTS on a schedule, so a stored cookie's copy goes stale within
+// minutes and auth starts failing. RotateCookies mints a fresh one from the durable
+// __Secure-1PSID — but only while the CURRENT __Secure-1PSIDTS is still valid (it is
+// keep-alive, not revive). Rotating on each bootstrap keeps a continuously-used connection
+// alive off a single seeded cookie. Fail-open: any error returns the cookie unchanged.
+export async function rotateGeminiPsidts(cookie, fetchImpl = fetch) {
+  try {
+    const res = await fetchImpl(GEMINI_ROTATE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie, "User-Agent": GEMINI_IMAGE_UA },
+      body: '[000,"-0000000000000000000"]',
+      dispatcher: GEMINI_HTTP_AGENT,
+    });
+    if (!res.ok) return cookie;
+    const setCookies = res.headers?.getSetCookie?.() || [];
+    let merged = cookie;
+    for (const sc of setCookies) {
+      const m = sc.match(/^([^=]+)=([^;]*)/);
+      if (!m || !GEMINI_ROTATING_COOKIE_RE.test(m[1])) continue;
+      const name = m[1], value = m[2];
+      merged = new RegExp(`(^|; )${name}=`).test(merged)
+        ? merged.replace(new RegExp(`${name}=[^;]*`), `${name}=${value}`)
+        : `${merged}; ${name}=${value}`;
+    }
+    return merged;
+  } catch {
+    return cookie;
+  }
+}
 
 export function parseGeminiAuthHtml(html, finalUrl) {
   const at = html.match(/"SNlM0e":"([^"]+)"/)?.[1] ?? null;
@@ -20,21 +59,36 @@ export function parseGeminiAuthHtml(html, finalUrl) {
 }
 
 export async function scrapeGeminiAuth(cookie, fetchImpl = fetch) {
-  const res = await fetchImpl(GEMINI_APP_URL, { headers: { Cookie: cookie }, dispatcher: GEMINI_HTTP_AGENT });
+  // Refresh __Secure-1PSIDTS first, then bootstrap /app with the freshened cookie. The
+  // effective cookie is returned so callers can reuse it (and persist it).
+  const effectiveCookie = await rotateGeminiPsidts(cookie, fetchImpl);
+  const res = await fetchImpl(GEMINI_APP_URL, { headers: { Cookie: effectiveCookie }, dispatcher: GEMINI_HTTP_AGENT });
   const html = await res.text();
-  return parseGeminiAuthHtml(html, res.url || GEMINI_APP_URL);
+  return { ...parseGeminiAuthHtml(html, res.url || GEMINI_APP_URL), cookie: effectiveCookie };
 }
 
 const authCache = new Map(); // connectionId -> { value, expiresAt }
+// Latest rotated cookie per connection, kept beyond the auth-cache TTL so each rotation
+// chains off the previous fresh cookie (not the stale seed) — this is what keeps the
+// PSIDTS lineage alive across the connection's lifetime.
+const liveCookieMap = new Map(); // connectionId -> cookie
+// Last cookie persisted to the DB per connection, so we only write on an actual change.
+const persistedCookieMap = new Map(); // connectionId -> cookie
 
 export function clearGeminiAuthCache() {
   authCache.clear();
+  liveCookieMap.clear();
+  persistedCookieMap.clear();
 }
 
 export async function getGeminiAuth(connectionId, cookie, fetchImpl = fetch) {
   const cached = authCache.get(connectionId);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
-  const value = await scrapeGeminiAuth(cookie, fetchImpl);
+  // Chain rotation off the last fresh cookie; fall back to the seeded cookie on a cold
+  // connection or after clearGeminiAuthCache.
+  const base = liveCookieMap.get(connectionId) || cookie;
+  const value = await scrapeGeminiAuth(base, fetchImpl);
+  if (value.cookie) liveCookieMap.set(connectionId, value.cookie);
   authCache.set(connectionId, { value, expiresAt: Date.now() + AUTH_CACHE_TTL_MS });
   return value;
 }
@@ -312,9 +366,6 @@ export function stripImagePlaceholder(text) {
     .trim();
 }
 
-const GEMINI_IMAGE_UA =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
-
 const GEMINI_MEDIA_MAX_BYTES = 12 * 1024 * 1024; // cap inlined media (esp. song videos)
 
 // Generated media (images, audio, video) is tied to the account session, so an external
@@ -435,6 +486,18 @@ export class GeminiWebExecutor extends BaseExecutor {
       return { response: jsonError(502, `Gemini bootstrap failed: ${err.message || String(err)}`), url: GEMINI_STREAM_GENERATE_URL, headers: {}, transformedBody: body };
     }
 
+    // Reuse the rotated cookie for every downstream request, and persist it (fire-and-forget)
+    // so it survives restarts and the next cold bootstrap starts from a still-valid PSIDTS.
+    let effectiveCookie = auth.cookie || cookie;
+    const persistCookie = () => {
+      if (!effectiveCookie || effectiveCookie === cookie) return;
+      if (persistedCookieMap.get(connectionId) === effectiveCookie) return; // no change since last write
+      if (typeof credentials?.onCredentialsRefreshed !== "function") return;
+      persistedCookieMap.set(connectionId, effectiveCookie);
+      Promise.resolve(credentials.onCredentialsRefreshed({ apiKey: effectiveCookie })).catch(() => { });
+    };
+    persistCookie();
+
     if (auth.redirectedToLogin) {
       log?.warn?.("GEMINI-WEB", "Bootstrap GET redirected to accounts.google.com — cookie invalid/expired");
       return { response: authInvalidError(), url: GEMINI_STREAM_GENERATE_URL, headers: {}, transformedBody: body };
@@ -460,7 +523,7 @@ export class GeminiWebExecutor extends BaseExecutor {
         "f.req": buildGeminiFreq(prompt, resolved.mode, resolved.think),
         at: authToUse.at || "",
       }).toString();
-      const headers = { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8", "X-Same-Domain": "1", Cookie: cookie };
+      const headers = { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8", "X-Same-Domain": "1", Cookie: effectiveCookie };
       const fetchOpts = { method: "POST", headers, body: bodyStr, dispatcher: GEMINI_HTTP_AGENT };
       if (signal) fetchOpts.signal = signal;
       const response = await fetchImpl(url, fetchOpts);
@@ -482,11 +545,16 @@ export class GeminiWebExecutor extends BaseExecutor {
       log?.warn?.("GEMINI-WEB", `StreamGenerate returned ${attempt.response.status}; re-bootstrapping auth and retrying once`);
       let freshAuth;
       try {
-        freshAuth = await scrapeGeminiAuth(cookie, fetchImpl);
+        freshAuth = await scrapeGeminiAuth(effectiveCookie, fetchImpl);
       } catch (err) {
         return { response: authInvalidError(), url: attempt.url, headers: {}, transformedBody: attempt.bodyStr };
       }
       authCache.set(connectionId, { value: freshAuth, expiresAt: Date.now() + AUTH_CACHE_TTL_MS });
+      if (freshAuth.cookie) {
+        effectiveCookie = freshAuth.cookie;
+        liveCookieMap.set(connectionId, effectiveCookie);
+        persistCookie();
+      }
       if (freshAuth.redirectedToLogin) {
         return { response: authInvalidError(), url: attempt.url, headers: {}, transformedBody: attempt.bodyStr };
       }
@@ -528,7 +596,7 @@ export class GeminiWebExecutor extends BaseExecutor {
     if (images.length > 0) {
       const dataUrls = [];
       for (const img of images) {
-        const fetched = await fetchGeminiImageBase64(img.url, cookie, fetchImpl);
+        const fetched = await fetchGeminiImageBase64(img.url, effectiveCookie, fetchImpl);
         if (fetched) dataUrls.push(`data:${fetched.contentType};base64,${fetched.b64}`);
       }
       if (dataUrls.length > 0) {
@@ -545,7 +613,7 @@ export class GeminiWebExecutor extends BaseExecutor {
     if (downloads.length > 0) {
       const links = [];
       for (const dl of downloads) {
-        const fetched = await fetchGeminiMediaBase64(dl.url, cookie, fetchImpl);
+        const fetched = await fetchGeminiMediaBase64(dl.url, effectiveCookie, fetchImpl);
         if (fetched && /^(audio|video|image)\//i.test(fetched.contentType)) {
           links.push(`[${dl.filename || "file"}](data:${fetched.contentType};base64,${fetched.b64})`);
         }

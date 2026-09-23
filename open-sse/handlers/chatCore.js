@@ -168,6 +168,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Expose raw client headers to translators/executors for session-id resolution
   if (credentials) credentials.rawHeaders = clientRawRequest?.headers || {};
 
+  // Let executors persist refreshed credentials (e.g. gemini-web's rotated cookie) via the
+  // same DB write-back path OAuth token refresh uses.
+  if (credentials && onCredentialsRefreshed) credentials.onCredentialsRefreshed = onCredentialsRefreshed;
+
   // Auto-strip media blocks the model can't read (vision/audio/pdf) before translation.
   if (!passthrough) {
     const caps = getCapabilitiesForModel(provider, model);
