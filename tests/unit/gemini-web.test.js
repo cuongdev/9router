@@ -314,6 +314,22 @@ describe("extractGeminiDownloads", () => {
     const frame = ["wrb.fr", null, JSON.stringify([null, null, null, null, [[[null, 1, "a.png", "https://lh3.googleusercontent.com/gg-dl/x"]]]])];
     expect(extractGeminiDownloads(JSON.stringify([frame]) + "\n")).toEqual([]);
   });
+
+  it("skips non-media downloads like thought_signature_*.pb", () => {
+    const audio = "https://contribution.usercontent.google.com/download?c=a&filename=music.mp3";
+    const sig = "https://contribution.usercontent.google.com/download?c=b&filename=thought_signature_123.pb";
+    const inner = [null, null, null, null, [["rc", ["x"], null, { "87": [[audio, sig]] }]]];
+    const frame = ["wrb.fr", null, JSON.stringify(inner)];
+    const files = extractGeminiDownloads(JSON.stringify([frame]) + "\n");
+    expect(files).toEqual([{ filename: "music.mp3", url: audio }]);
+  });
+
+  it("finds download URLs nested inside JSON objects (not just arrays)", () => {
+    const audio = "https://contribution.usercontent.google.com/download?c=a&filename=song.mp3";
+    const inner = [null, null, null, null, [["rc", ["x"], null, { "87": [[null, [audio]]] }]]];
+    const frame = ["wrb.fr", null, JSON.stringify(inner)];
+    expect(extractGeminiDownloads(JSON.stringify([frame]) + "\n")).toEqual([{ filename: "song.mp3", url: audio }]);
+  });
 });
 
 describe("stripImagePlaceholder", () => {

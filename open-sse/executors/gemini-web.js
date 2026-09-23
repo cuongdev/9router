@@ -257,6 +257,10 @@ export function extractGeminiImages(rawText) {
 // as usercontent.google.com/download links carrying a ?filename= (e.g. music.mp3,
 // output.mp4). Walk the frame and collect each unique download URL with its filename.
 const GEMINI_DOWNLOAD_URL_RE = /^https:\/\/[a-z0-9.-]*usercontent\.google\.com\/download\b/i;
+// Only surface real media downloads. The same download host also serves internal
+// artifacts like `thought_signature_*.pb` (protobuf reasoning state) that must not
+// leak to the client.
+const GEMINI_MEDIA_EXT_RE = /\.(mp3|wav|m4a|aac|flac|ogg|opus|mp4|mov|webm|mkv|png|jpe?g|gif|webp)$/i;
 
 export function extractGeminiDownloads(rawText) {
   const files = [];
@@ -273,6 +277,8 @@ export function extractGeminiDownloads(rawText) {
         seen.add(node);
         let filename = null;
         try { filename = new URL(node).searchParams.get("filename"); } catch { /* ignore */ }
+        // Skip non-media downloads (e.g. thought_signature_*.pb).
+        if (filename && !GEMINI_MEDIA_EXT_RE.test(filename)) return;
         files.push({ filename, url: node });
       }
     }
@@ -540,7 +546,9 @@ export class GeminiWebExecutor extends BaseExecutor {
       const links = [];
       for (const dl of downloads) {
         const fetched = await fetchGeminiMediaBase64(dl.url, cookie, fetchImpl);
-        if (fetched) links.push(`[${dl.filename || "file"}](data:${fetched.contentType};base64,${fetched.b64})`);
+        if (fetched && /^(audio|video|image)\//i.test(fetched.contentType)) {
+          links.push(`[${dl.filename || "file"}](data:${fetched.contentType};base64,${fetched.b64})`);
+        }
       }
       if (links.length > 0) {
         const markdown = links.join("\n\n");
