@@ -122,7 +122,11 @@ export async function PUT(request, { params }) {
     if (globalPriority !== undefined) updateData.globalPriority = globalPriority;
     if (defaultModel !== undefined) updateData.defaultModel = defaultModel;
     if (isActive !== undefined) updateData.isActive = isActive;
-    if (apiKey && existing.authType === "apikey") updateData.apiKey = apiKey;
+    // Allow refreshing the secret in-place for both API-key and cookie auth. Cookie
+    // providers (e.g. gemini-web) store the cookie in `apiKey`; updating it in-place keeps
+    // the connection id stable, so a cookie refresh does not break API-key access policies
+    // that pin this connection.
+    if (apiKey && (existing.authType === "apikey" || existing.authType === "cookie")) updateData.apiKey = apiKey;
     if (testStatus !== undefined) updateData.testStatus = testStatus;
     if (lastError !== undefined) updateData.lastError = lastError;
     if (lastErrorAt !== undefined) updateData.lastErrorAt = lastErrorAt;
