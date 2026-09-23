@@ -13,6 +13,12 @@ import {
   GEMINI_MODEL_SHORT_NAMES,
   buildGeminiFreq,
   extractGeminiText,
+  extractGeminiImages,
+  extractGeminiDownloads,
+  stripImagePlaceholder,
+  fetchGeminiImageBase64,
+  fetchGeminiMediaBase64,
+  parseAspectSuffix,
   GeminiWebExecutor,
 } from "../../open-sse/executors/gemini-web.js";
 
@@ -240,6 +246,165 @@ describe("extractGeminiText", () => {
   });
 });
 
+// Faithful shape of a real StreamGenerate image-generation frame: the answer text is a
+// placeholder token, and each generated image is an auth-gated gg-dl URL nested a few
+// levels under the candidate as [null, 1, "<filename>.png", "<url>", null, "<sig>"].
+function mockStreamGenerateImageBody(
+  url = "https://lh3.googleusercontent.com/gg-dl/AAQ_test_generated_image_url",
+  answerText = "\n\nhttp://googleusercontent.com/image_generation_content/0_608\n\n",
+) {
+  const inner = [
+    null,
+    ["c_conv", "r_resp"],
+    null,
+    null,
+    [[
+      "rc_1",
+      [answerText],
+      null, null, null, null, null, null, [1], null, null, null,
+      [null, null, null, null, null, null, null,
+        [[[[null, null, null, [null, 1, "watermarked_img_123.png", url, null, "$sig"]]]]],
+      ],
+    ]],
+  ];
+  const frame = ["wrb.fr", null, JSON.stringify(inner)];
+  return JSON.stringify([frame]) + "\n";
+}
+
+describe("extractGeminiImages", () => {
+  it("pulls the gg-dl image URL and its filename from a generation frame", () => {
+    const images = extractGeminiImages(mockStreamGenerateImageBody());
+    expect(images).toEqual([
+      { filename: "watermarked_img_123.png", url: "https://lh3.googleusercontent.com/gg-dl/AAQ_test_generated_image_url" },
+    ]);
+  });
+
+  it("returns an empty array for a text-only frame", () => {
+    const frame = ["wrb.fr", null, JSON.stringify([null, null, null, null, [[null, ["just text"]]]])];
+    expect(extractGeminiImages(JSON.stringify([frame]) + "\n")).toEqual([]);
+  });
+
+  it("de-dupes a URL that appears more than once in the frame", () => {
+    const url = "https://lh3.googleusercontent.com/gg-dl/AAQ_dupe";
+    const inner = [null, null, null, null, [[[null, 1, "a.png", url], [null, 1, "a.png", url]]]];
+    const frame = ["wrb.fr", null, JSON.stringify(inner)];
+    expect(extractGeminiImages(JSON.stringify([frame]) + "\n")).toHaveLength(1);
+  });
+});
+
+describe("extractGeminiDownloads", () => {
+  it("pulls usercontent download URLs with their filename (audio/video)", () => {
+    const audio = "https://contribution.usercontent.google.com/download?c=abc&filename=music.mp3&opi=1";
+    const video = "https://contribution.usercontent.google.com/download?c=def&filename=output.mp4";
+    const inner = [null, null, null, null, [["rc", ["a song"], null, [null, [audio, video]]]]];
+    const frame = ["wrb.fr", null, JSON.stringify(inner)];
+    const files = extractGeminiDownloads(JSON.stringify([frame]) + "\n");
+    expect(files).toEqual([
+      { filename: "music.mp3", url: audio },
+      { filename: "output.mp4", url: video },
+    ]);
+  });
+
+  it("returns an empty array when there are no download URLs", () => {
+    const frame = ["wrb.fr", null, JSON.stringify([null, null, null, null, [[null, ["plain text"]]]])];
+    expect(extractGeminiDownloads(JSON.stringify([frame]) + "\n")).toEqual([]);
+  });
+
+  it("does not treat gg-dl image URLs as downloads", () => {
+    const frame = ["wrb.fr", null, JSON.stringify([null, null, null, null, [[[null, 1, "a.png", "https://lh3.googleusercontent.com/gg-dl/x"]]]])];
+    expect(extractGeminiDownloads(JSON.stringify([frame]) + "\n")).toEqual([]);
+  });
+});
+
+describe("stripImagePlaceholder", () => {
+  it("removes the image_generation_content placeholder and trims", () => {
+    expect(stripImagePlaceholder("\n\nhttp://googleusercontent.com/image_generation_content/0_608\n\n")).toBe("");
+  });
+
+  it("keeps a caption around the placeholder", () => {
+    const out = stripImagePlaceholder("Here you go:\n\nhttp://googleusercontent.com/image_generation_content/0_1\n\nEnjoy!");
+    expect(out).toBe("Here you go:\n\nEnjoy!");
+  });
+
+  it("leaves plain text untouched (byte-identical)", () => {
+    expect(stripImagePlaceholder("Hello from Gemini")).toBe("Hello from Gemini");
+    expect(stripImagePlaceholder("  leading and trailing  ")).toBe("  leading and trailing  ");
+  });
+});
+
+describe("fetchGeminiImageBase64", () => {
+  it("fetches with the connection cookie and returns base64 + content type", async () => {
+    let capturedOpts;
+    const fetchImpl = vi.fn(async (url, opts) => {
+      capturedOpts = opts;
+      return { ok: true, headers: { get: () => "image/png" }, arrayBuffer: async () => new TextEncoder().encode("PNGDATA").buffer };
+    });
+    const out = await fetchGeminiImageBase64("https://lh3.googleusercontent.com/gg-dl/x", "cookie-abc", fetchImpl);
+    expect(capturedOpts.headers.Cookie).toBe("cookie-abc");
+    expect(out.contentType).toBe("image/png");
+    expect(Buffer.from(out.b64, "base64").toString()).toBe("PNGDATA");
+  });
+
+  it("follows 302 redirects, re-attaching the cookie on every hop (undici drops it cross-origin)", async () => {
+    const cookiesSeen = [];
+    const hops = [
+      { status: 302, headers: { get: (k) => (k === "location" ? "https://work.fife.usercontent.google.com/rd-gg-dl/y" : null) } },
+      { status: 302, headers: { get: (k) => (k === "location" ? "https://lh3.googleusercontent.com/rd-gg-dl/z" : null) } },
+      { ok: true, status: 200, headers: { get: (k) => (k === "content-type" ? "image/png" : null) }, arrayBuffer: async () => new TextEncoder().encode("PNGBYTES").buffer },
+    ];
+    let i = 0;
+    const fetchImpl = vi.fn(async (_url, opts) => {
+      cookiesSeen.push(opts?.headers?.Cookie);
+      return hops[i++];
+    });
+    const out = await fetchGeminiImageBase64("https://lh3.googleusercontent.com/gg-dl/x", "cookie-abc", fetchImpl);
+    expect(out).toEqual({ b64: Buffer.from("PNGBYTES").toString("base64"), contentType: "image/png" });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(cookiesSeen).toEqual(["cookie-abc", "cookie-abc", "cookie-abc"]);
+  });
+
+  it("returns null when the final response is not an image (e.g. a 403 HTML page slipped through)", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, status: 200, headers: { get: () => "text/html" }, arrayBuffer: async () => new ArrayBuffer(8) }));
+    expect(await fetchGeminiImageBase64("https://lh3.googleusercontent.com/gg-dl/x", "c", fetchImpl)).toBeNull();
+  });
+
+  it("fails open (returns null) on a non-ok response", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: false, status: 404, headers: { get: () => null } }));
+    expect(await fetchGeminiImageBase64("https://lh3.googleusercontent.com/gg-dl/x", "c", fetchImpl)).toBeNull();
+  });
+
+  it("fails open (returns null) when the fetch throws", async () => {
+    const fetchImpl = vi.fn(async () => { throw new Error("network"); });
+    expect(await fetchGeminiImageBase64("https://lh3.googleusercontent.com/gg-dl/x", "c", fetchImpl)).toBeNull();
+  });
+});
+
+describe("parseAspectSuffix", () => {
+  it("returns the model unchanged with no hint when there is no suffix", () => {
+    expect(parseAspectSuffix("gemini-web-flash")).toEqual({ baseModel: "gemini-web-flash", aspectHint: null });
+  });
+
+  it("splits a known ratio suffix into the base model and a natural-language hint", () => {
+    expect(parseAspectSuffix("gemini-web-flash:16x9")).toEqual({
+      baseModel: "gemini-web-flash",
+      aspectHint: "a wide 16:9 landscape aspect ratio",
+    });
+    expect(parseAspectSuffix("gemini-web-pro:1x1").aspectHint).toBe("a square 1:1 aspect ratio");
+    expect(parseAspectSuffix("gemini-web-flash:9x16").aspectHint).toContain("9:16");
+  });
+
+  it("accepts an arbitrary NxN ratio not in the preset map", () => {
+    expect(parseAspectSuffix("gemini-web-flash:21x9")).toEqual({
+      baseModel: "gemini-web-flash",
+      aspectHint: "a 21:9 aspect ratio",
+    });
+  });
+
+  it("ignores a trailing colon that is not a valid ratio", () => {
+    expect(parseAspectSuffix("gemini-web-flash:pro")).toEqual({ baseModel: "gemini-web-flash:pro", aspectHint: null });
+  });
+});
+
 function mockGeminiHtml() {
   return SAMPLE_HTML_LOGGED_IN;
 }
@@ -438,5 +603,116 @@ describe("GeminiWebExecutor.execute", () => {
     expect(response.status).toBe(401);
     const json = await response.json();
     expect(json.error.message).toMatch(/cookie|dán lại/i);
+  });
+
+  it("inlines a generated image as a base64 markdown image and strips the placeholder", async () => {
+    let imageFetchCookie;
+    const fetchImpl = vi.fn(async (url, opts) => {
+      if (url.includes("/app")) return { url: "https://gemini.google.com/app", text: async () => mockGeminiHtml() };
+      if (url.includes("otAQ7b")) return { text: async () => SAMPLE_MODEL_LIST_FRAME };
+      if (url.includes("StreamGenerate")) return { ok: true, status: 200, text: async () => mockStreamGenerateImageBody() };
+      if (url.includes("gg-dl")) {
+        imageFetchCookie = opts?.headers?.Cookie;
+        return { ok: true, headers: { get: () => "image/png" }, arrayBuffer: async () => new TextEncoder().encode("IMG").buffer };
+      }
+      throw new Error(`unexpected fetch url: ${url}`);
+    });
+    const exec = new GeminiWebExecutor();
+    const { response } = await exec.execute({
+      model: "gemini-web-flash",
+      body: { messages: [{ role: "user", content: "draw a red bicycle" }] },
+      stream: false,
+      credentials: { apiKey: "cookie-fixture-abc", connectionId: "conn-img" },
+      fetchImpl,
+    });
+    const json = await response.json();
+    expect(response.status).toBe(200);
+    const content = json.choices[0].message.content;
+    // Placeholder token is gone; image is inlined as a base64 data URL markdown image.
+    expect(content).not.toContain("image_generation_content");
+    expect(content).toContain(`![generated image](data:image/png;base64,${Buffer.from("IMG").toString("base64")})`);
+    // Image was fetched server-side with the connection cookie (URL is auth-gated).
+    expect(imageFetchCookie).toBe("cookie-fixture-abc");
+    // Token usage is estimated from the text part, not the base64 blob.
+    expect(json.usage.prompt_tokens).toBeLessThan(50);
+  });
+
+  it("still returns the text turn when the image fetch fails (fail-open)", async () => {
+    const fetchImpl = vi.fn(async (url) => {
+      if (url.includes("/app")) return { url: "https://gemini.google.com/app", text: async () => mockGeminiHtml() };
+      if (url.includes("otAQ7b")) return { text: async () => SAMPLE_MODEL_LIST_FRAME };
+      if (url.includes("StreamGenerate")) {
+        // A caption plus the placeholder, so stripped text is non-empty.
+        const body = mockStreamGenerateImageBody(
+          "https://lh3.googleusercontent.com/gg-dl/AAQ_test_generated_image_url",
+          "Here is your image:\n\nhttp://googleusercontent.com/image_generation_content/0_1\n\n",
+        );
+        return { ok: true, status: 200, text: async () => body };
+      }
+      if (url.includes("gg-dl")) return { ok: false, status: 403 };
+      throw new Error(`unexpected fetch url: ${url}`);
+    });
+    const exec = new GeminiWebExecutor();
+    const { response } = await exec.execute({
+      model: "gemini-web-flash",
+      body: { messages: [{ role: "user", content: "draw a red bicycle" }] },
+      stream: false,
+      credentials: { apiKey: "cookie-fixture-abc", connectionId: "conn-img2" },
+      fetchImpl,
+    });
+    const json = await response.json();
+    expect(response.status).toBe(200);
+    expect(json.choices[0].message.content).toContain("Here is your image:");
+    expect(json.choices[0].message.content).not.toContain("data:image");
+  });
+
+  it("strips a :NxN aspect suffix for model resolution and folds the ratio into the prompt", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const exec = new GeminiWebExecutor();
+    const { response } = await exec.execute({
+      model: "gemini-web-flash:9x16",
+      body: { messages: [{ role: "user", content: "a red apple" }] },
+      stream: false,
+      credentials: { apiKey: "cookie-fixture-abc", connectionId: "conn-aspect" },
+      fetchImpl,
+    });
+    // Base model still resolves (a 200, not a "model not found" style failure).
+    expect(response.status).toBe(200);
+    // The StreamGenerate request body carries the ratio hint folded into the prompt.
+    const streamCall = calls.find((c) => c.url.includes("StreamGenerate"));
+    const fReq = new URLSearchParams(streamCall.opts.body).get("f.req");
+    expect(fReq).toContain("9:16");
+    expect(fReq).toContain("a red apple");
+  });
+
+  it("inlines a generated audio file as a base64 data-URL markdown link", async () => {
+    const audioUrl = "https://contribution.usercontent.google.com/download?c=abc&filename=music.mp3";
+    const inner = [null, ["c", "r"], null, null, [["rc", ["Here is your song"], null, [null, [audioUrl]]]]];
+    const streamBody = JSON.stringify([["wrb.fr", null, JSON.stringify(inner)]]) + "\n";
+    let mediaCookie;
+    const fetchImpl = vi.fn(async (url, opts) => {
+      if (url.includes("/app")) return { url: "https://gemini.google.com/app", text: async () => mockGeminiHtml() };
+      if (url.includes("otAQ7b")) return { text: async () => SAMPLE_MODEL_LIST_FRAME };
+      if (url.includes("StreamGenerate")) return { ok: true, status: 200, text: async () => streamBody };
+      if (url.includes("usercontent.google.com/download")) {
+        mediaCookie = opts?.headers?.Cookie;
+        return { ok: true, status: 200, headers: { get: () => "audio/mpeg" }, arrayBuffer: async () => new TextEncoder().encode("MP3").buffer };
+      }
+      throw new Error(`unexpected fetch url: ${url}`);
+    });
+    const exec = new GeminiWebExecutor();
+    const { response } = await exec.execute({
+      model: "gemini-web-flash",
+      body: { messages: [{ role: "user", content: "make a song" }] },
+      stream: false,
+      credentials: { apiKey: "cookie-fixture-abc", connectionId: "conn-audio" },
+      fetchImpl,
+    });
+    const json = await response.json();
+    expect(response.status).toBe(200);
+    const content = json.choices[0].message.content;
+    expect(content).toContain("Here is your song");
+    expect(content).toContain(`[music.mp3](data:audio/mpeg;base64,${Buffer.from("MP3").toString("base64")})`);
+    expect(mediaCookie).toBe("cookie-fixture-abc");
   });
 });
