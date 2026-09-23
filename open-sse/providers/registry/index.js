@@ -123,9 +123,9 @@ import p117 from "./tokenrouter.js";
 import p118 from "./selfhosted-stt.js";
 import p119 from "./selfhosted-tts.js";
 import p120 from "./selfhosted-embedding.js";
-import p121 from "./fish-audio.js";
-import p122 from "./alitp-intl.js";
-import p123 from "./xquik.js";
+import p125 from "./fish-audio.js";
+import p126 from "./alitp-intl.js";
+import p127 from "./xquik.js";
 
 export default [
   p0,
@@ -250,7 +250,7 @@ export default [
   p118,
   p119,
   p120,
-  p121,
-  p122,
-  p123,
+  p125,
+  p126,
+  p127,
 ];

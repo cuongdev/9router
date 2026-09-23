@@ -2,10 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   buildModelsList: vi.fn(),
+  getDiscoveryAccessPolicy: vi.fn(),
 }));
 
 vi.mock("../../src/app/api/v1/models/route.js", () => ({
   buildModelsList: mocks.buildModelsList,
+  getDiscoveryAccessPolicy: mocks.getDiscoveryAccessPolicy,
 }));
 
 const { GET } = await import("../../src/app/api/v1/models/[...model]/route.js");
@@ -24,6 +26,9 @@ function params(model) {
 describe("GET /v1/models/{id}", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // The catch-all route threads the API-key access policy into buildModelsList so
+    // /v1/models/{kind} and single-model lookup honor per-key access control.
+    mocks.getDiscoveryAccessPolicy.mockResolvedValue(null);
   });
 
   it("retrieves a provider-prefixed model ID split across URL path segments", async () => {
@@ -33,7 +38,7 @@ describe("GET /v1/models/{id}", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual(chatModel);
-    expect(mocks.buildModelsList).toHaveBeenCalledWith(["llm"]);
+    expect(mocks.buildModelsList).toHaveBeenCalledWith(["llm"], { accessPolicy: null });
   });
 
   it("also handles a decoded slash in a single catch-all segment", async () => {
@@ -53,7 +58,7 @@ describe("GET /v1/models/{id}", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ object: "list", data: [imageModel] });
-    expect(mocks.buildModelsList).toHaveBeenCalledWith(["image"]);
+    expect(mocks.buildModelsList).toHaveBeenCalledWith(["image"], { accessPolicy: null });
   });
 
   it("returns an OpenAI-style model_not_found response for an unknown model", async () => {
